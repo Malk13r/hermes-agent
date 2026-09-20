@@ -339,6 +339,49 @@ class HomeChannel:
         return cls(platform=Platform(data["platform"]), chat_id=str(data["chat_id"]), name=data.get("name", "Home"), **optional)
 
 
+def _parse_gateway_restart_channel(
+    raw: Any, *, expected_platform: Optional[Platform] = None,
+) -> Optional[HomeChannel]:
+    """Validate the local lifecycle override without logging destination/provenance values.
+
+    Also used at delivery for programmatically constructed PlatformConfig objects. Ordinary
+    home-channel parsing and routing deliberately retain their existing behaviour.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, HomeChannel):
+        raw = {**vars(raw), "platform": raw.platform.value if isinstance(raw.platform, Platform) else raw.platform}
+    try:
+        if not isinstance(raw, dict):
+            raise ValueError
+        if not isinstance(raw.get("platform"), str) or not raw["platform"].strip():
+            raise ValueError
+        platform = Platform(raw["platform"])
+        if expected_platform is not None and platform != expected_platform:
+            raise ValueError
+        # Numeric chat/topic IDs are HomeChannel-compatible; bools, floats and containers are not.
+        for key in ("chat_id", "thread_id", "user_id", "scope_id"):
+            value = raw.get(key)
+            if key != "chat_id" and value is None:
+                continue
+            if type(value) not in (str, int) or not str(value).strip():
+                raise ValueError
+        if "name" in raw and not isinstance(raw["name"], str):
+            raise ValueError
+        normalized = dict(raw)
+        for key in ("chat_id", "thread_id", "user_id", "scope_id"):
+            if raw.get(key) is not None:
+                normalized[key] = str(raw[key])
+        return HomeChannel.from_dict(normalized)
+    except (KeyError, TypeError, ValueError):
+        # Never include the raw mapping, IDs, platform token, or parser exception: all can contain PII.
+        logger.warning(
+            "Ignoring invalid gateway_restart_channel; expected a same-platform mapping with "
+            "nonblank scalar IDs; lifecycle notices will fall back to the home channel"
+        )
+        return None
+
+
 def persist_home_channel(home: HomeChannel, *, enabled_if_new: bool = False) -> None:
     """Persist a logical home without falsely enabling a Relay-fronted adapter."""
     from hermes_cli.config import load_config, save_config
@@ -426,6 +469,8 @@ class PlatformConfig:
     typing_status_text: Optional[str] = None
     channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
     extra: Dict[str, Any] = field(default_factory=dict)  # Platform-specific settings
+    # TEMPORARY local carry of #84874. Append to preserve positional constructor compatibility.
+    gateway_restart_channel: Optional[HomeChannel] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -437,6 +482,8 @@ class PlatformConfig:
         }
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
+        if self.gateway_restart_channel:
+            result["gateway_restart_channel"] = self.gateway_restart_channel.to_dict()
         if self.channel_overrides:
             result["channel_overrides"] = {cid: ov.to_dict() for cid, ov in self.channel_overrides.items()}
         return result
@@ -445,11 +492,13 @@ class PlatformConfig:
     # config and belongs in ``extra`` (see from_dict).
     _TYPED_KEYS = frozenset({
         "enabled", "token", "api_key", "home_channel", "reply_to_mode", "channel_overrides", "extra",
-        "gateway_restart_notification", "typing_indicator", "typing_status_text",
+        "gateway_restart_notification", "gateway_restart_channel", "typing_indicator", "typing_status_text",
     })
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PlatformConfig":
+    def from_dict(
+        cls, data: Dict[str, Any], *, expected_platform: Optional[Platform] = None,
+    ) -> "PlatformConfig":
         data = _coerce_dict(data)
         home = data.get("home_channel")
         # Adapters read their settings from ``extra`` (``config.extra.get("port")``), but users
@@ -474,6 +523,9 @@ class PlatformConfig:
             token=data.get("token"),
             api_key=data.get("api_key"),
             home_channel=HomeChannel.from_dict(home) if isinstance(home, dict) else None,
+            gateway_restart_channel=_parse_gateway_restart_channel(
+                data.get("gateway_restart_channel"), expected_platform=expected_platform,
+            ),
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(toplevel_or_extra("gateway_restart_notification"), True),
             typing_indicator=_coerce_bool(toplevel_or_extra("typing_indicator"), True),
@@ -726,7 +778,11 @@ class GatewayConfig:
                 if dicts_only and not isinstance(block, dict):
                     continue
                 try:
-                    out[Platform(platform_name)] = parse(block)
+                    platform = Platform(platform_name)
+                    out[platform] = (
+                        parse(block, expected_platform=platform)
+                        if parse == PlatformConfig.from_dict else parse(block)
+                    )
                 except ValueError:
                     pass
             return out
