@@ -412,7 +412,7 @@ describe('quickstart', () => {
   })
 
   it('pins the quickstart progress view while the job runs', async () => {
-    $localRuntimeJobs.set([
+    const jobs: LocalRuntimeJob[] = [
       {
         job_id: 'q1',
         kind: 'quickstart',
@@ -426,8 +426,13 @@ describe('quickstart', () => {
         percent: 30,
         error: null
       }
-    ])
-    renderPane()
+    ]
+    mocked.getLocalModelsJobs.mockResolvedValue({ jobs })
+    $localRuntimeJobs.set(jobs)
+    await act(async () => {
+      renderPane()
+    })
+    await waitFor(() => expect(mocked.getLocalModelsJobs).toHaveBeenCalled())
 
     expect(await screen.findByText('Qwen3.6 27B — 17.6 GB')).toBeTruthy()
     // One job, one view: no setup or model-choice buttons while it runs.
