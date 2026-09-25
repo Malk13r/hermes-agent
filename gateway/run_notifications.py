@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
-from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
+from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES, _parse_gateway_restart_channel
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
@@ -871,20 +871,31 @@ class GatewayNotificationsMixin:
             for platform, platform_cfg in profile_cfg.platforms.items():
                 yield profile, platform, platform_cfg
 
-    def _served_home_channel_transports(self):
-        """``(profile, platform, platform_cfg, home, transport)`` for every served profile's home
-        channel with a live transport — the launch profile's (``profile`` ``None``) first."""
-        for platform, platform_cfg, home, transport in self._home_channel_transports():
-            yield None, platform, platform_cfg, home, transport
-        for profile, profile_cfg in (getattr(self, "_profile_configs", None) or {}).items():
-            adapters = (getattr(self, "_profile_adapters", None) or {}).get(profile) or {}
-            for platform, platform_cfg in profile_cfg.platforms.items():
-                home = platform_cfg.home_channel
-                if not home or not home.chat_id:
-                    continue
-                transport = _safe_delivery_transport(platform, profile_cfg, adapters, profile=profile)
-                if transport is None:
-                    continue
+    def _resolve_lifecycle_transport(self, platform, platform_cfg, config, adapters, *, profile=None):
+        """An explicit override must not hide a failed enabled native bot behind Relay."""
+        if platform_cfg.enabled and adapters.get(platform) is None:
+            logger.debug("Skipping lifecycle override: no connected native adapter for %s", platform.value)
+            return None
+        return _safe_delivery_transport(platform, config, adapters, profile=profile)
+
+    def _served_lifecycle_transports(self):
+        """Lifecycle override (otherwise home), resolved only against its owning profile's bots."""
+        for profile, platform, platform_cfg in self._served_home_channel_configs():
+            restart_channel = _parse_gateway_restart_channel(
+                platform_cfg.gateway_restart_channel, expected_platform=platform,
+            )
+            home = restart_channel or platform_cfg.home_channel
+            if not home or not home.chat_id:
+                continue
+            config = self.config if profile is None else self._profile_configs[profile]
+            adapters = (self.adapters if profile is None else
+                        (getattr(self, "_profile_adapters", None) or {}).get(profile) or {})
+            transport = (
+                self._resolve_lifecycle_transport(platform, platform_cfg, config, adapters, profile=profile)
+                if restart_channel is not None else
+                _safe_delivery_transport(platform, config, adapters, profile=profile)
+            )
+            if transport is not None:
                 yield profile, platform, platform_cfg, home, transport
 
     async def _send_home_channel_message(self, platform, home, transport, message: str, failure_fmt: str) -> bool:
@@ -955,14 +966,17 @@ class GatewayNotificationsMixin:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
-                # Owed targets come from config, not live transports: a removed home or an opt-out
-                # (gateway_restart_notification=false) must not keep the marker alive forever.
-                owed = {
-                    _served_notice_target_key(
-                        profile, platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
-                    for profile, platform, cfg in self._served_home_channel_configs()
-                    if cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
-                }
+                # Account for the same override/home destination as delivery, including
+                # unavailable bots. A superseded home must not keep the marker pending.
+                owed = set()
+                for profile, platform, cfg in self._served_home_channel_configs():
+                    if not cfg.gateway_restart_notification:
+                        continue
+                    home = _parse_gateway_restart_channel(
+                        cfg.gateway_restart_channel, expected_platform=platform,
+                    ) or cfg.home_channel
+                    if home and home.chat_id:
+                        owed.add(_served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id))
                 delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
                 if owed <= delivered:
                     path.unlink(missing_ok=True)
@@ -975,7 +989,7 @@ class GatewayNotificationsMixin:
     async def _send_home_channel_startup_notifications(
         self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None
     ) -> set[tuple[str, str, Optional[str]]]:
-        """Notify EVERY served profile's configured home channels that the gateway is back online.
+        """Notify EVERY served profile's lifecycle override (otherwise home) that the gateway is online.
 
         Best-effort, once per home CHAT — several served profiles can share one chat (a single
         Telegram group for the whole host), and one host process restarting once owes that chat
@@ -989,7 +1003,7 @@ class GatewayNotificationsMixin:
         free_tier_line = self._free_tier_startup_line()
         if free_tier_line:
             message = f"{message}\n{free_tier_line}"
-        targets = list(self._served_home_channel_transports())
+        targets = list(self._served_lifecycle_transports())
         # A chat already notified for ANOTHER profile is not notified again.
         notified_chats = {
             _delivery_target_key(platform.value, home.chat_id, home.thread_id)

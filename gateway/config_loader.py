@@ -269,6 +269,14 @@ def bridge_platform_shared_keys(
         if not isinstance(platform_cfg, dict):
             continue
         bridged = _bridged_keys(plat, platform_cfg, gw_data, root_block=cfg_toplevel)
+        if "gateway_restart_channel" in platform_cfg:
+            plat_data = _dict_slot(platforms_data, plat.value)
+            # A typed PlatformConfig field, NOT an adapter extra. The nested maps have
+            # already been merged; only the root platform block may override that result.
+            # Keep null/malformed input so it clears a lower-precedence override rather
+            # than resurrecting it. Malformed (non-null) values warn during validation.
+            if cfg_toplevel or "gateway_restart_channel" not in plat_data:
+                plat_data["gateway_restart_channel"] = platform_cfg["gateway_restart_channel"]
         has_channel_overrides = "channel_overrides" in platform_cfg
         if has_channel_overrides and isinstance(platform_cfg.get("channel_overrides"), dict):
             plat_data = _dict_slot(platforms_data, plat.value)

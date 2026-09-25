@@ -21,7 +21,7 @@ from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from gateway.config import Platform
+from gateway.config import Platform, _parse_gateway_restart_channel
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
@@ -1083,9 +1083,39 @@ class GatewayShutdownMixin:
                     "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
                 )
                 return
-        # Snapshot adapters: adapter.send() can hit a fatal path (_handle_fatal) that pops the adapter
-        # from self.adapters -> ``RuntimeError: dictionary changed size during iteration``.
-        for platform, adapter in list(self.adapters.items()):
+        # Keep the release's native-only home broadcasts. Add logical platforms ONLY when
+        # explicitly configured with the local override (including native targets without home).
+        # Snapshot adapters: a fatal send may pop an adapter while this loop is running.
+        broadcast_adapters = dict(self.adapters)
+        for platform, platform_cfg in self.config.platforms.items():
+            if platform_cfg.gateway_restart_channel is not None:
+                broadcast_adapters.setdefault(platform, None)
+        for platform, adapter in broadcast_adapters.items():
+            platform_cfg = self.config.platforms.get(platform)
+            restart_channel = _parse_gateway_restart_channel(
+                platform_cfg.gateway_restart_channel if platform_cfg else None, expected_platform=platform,
+            )
+            if restart_channel is not None:
+                if not self._notice_allowed(platform, "lifecycle channel"):
+                    continue
+                transport = self._resolve_lifecycle_transport(platform, platform_cfg, self.config, self.adapters)
+                if transport is None:
+                    continue
+                dedup_key = _notice_target_key(platform.value, restart_channel.chat_id, restart_channel.thread_id)
+                if dedup_key in notified:
+                    continue
+                async def _send_lifecycle(platform=platform, home=restart_channel,
+                                          transport=transport, dedup_key=dedup_key):
+                    if await self._send_home_channel_message(
+                        platform, home, transport, msg,
+                        "Lifecycle-channel shutdown notification failed for %s:%s: %s",
+                    ):
+                        notified.add(dedup_key)
+                from gateway.warning_notifications import present_notification
+                await present_notification(_send_lifecycle, platform=platform)
+                continue
+            if adapter is None:
+                continue
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue

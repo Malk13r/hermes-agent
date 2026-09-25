@@ -22,7 +22,9 @@ it('keeps the desktop toggle local across config refreshes', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      // jsdom Storage ignores instance overrides; the setup fallback owns its methods.
+      const storageMethods = Object.hasOwn(localStorage, 'setItem') ? localStorage : Object.getPrototypeOf(localStorage)
+      const write = vi.spyOn(storageMethods, 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -37,6 +39,7 @@ it('keeps the desktop toggle local across config refreshes', async () => {
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: !enabled } })
         expect(prefs.$autoSpeakReplies.get()).toBe(enabled)
         expect(saveHermesConfig).not.toHaveBeenCalled()
+        expect(write).toHaveBeenCalledOnce()
         expect(localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
       } finally {
         write.mockRestore()
@@ -51,7 +54,9 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      // jsdom Storage ignores instance overrides; the setup fallback owns its methods.
+      const storageMethods = Object.hasOwn(localStorage, 'setItem') ? localStorage : Object.getPrototypeOf(localStorage)
+      const write = vi.spyOn(storageMethods, 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -65,6 +70,7 @@ it('migrates the legacy preference once, not on every refresh', async () => {
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: enabled } })
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: !enabled } })
         expect(prefs.$autoSpeakReplies.get()).toBe(enabled)
+        expect(write).toHaveBeenCalledOnce()
         expect(localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
       } finally {
         write.mockRestore()
