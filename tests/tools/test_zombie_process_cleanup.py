@@ -195,9 +195,12 @@ class TestGatewayCleanupWiring:
         import threading
         from unittest.mock import MagicMock, patch
 
+        from gateway.config import GatewayConfig
         from gateway.run import GatewayRunner
 
         runner = object.__new__(GatewayRunner)
+        # __new__ bypasses the config that shutdown lifecycle routing requires.
+        runner.config = GatewayConfig()
         runner._running = True
         runner._running_agents = {}
         runner._running_agents_ts = {}
