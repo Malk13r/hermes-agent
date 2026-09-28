@@ -786,6 +786,14 @@ def _refresh_expired_codex_probe_token(
 def _probe_codex_pool_entry_quota_restored(entry: Dict[str, Any]) -> Optional[bool]:
     """``_probe_codex_quota_restored`` for a persisted pool entry, refreshing an expired token first."""
     from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+    from agent.credential_pool_borrowed_grant import codex_borrowed_root
+    if codex_borrowed_root() is not None:
+        # The row belongs to root: rotating it here would redeem root's token outside root's lock
+        # and persist the new pair into a profile store that has no such row, dropping it.
+        from agent.credential_pool import load_pool
+        pool = load_pool("openai-codex")
+        live = next((e for e in pool.entries() if e.id == entry.get("id")), None)
+        return pool._codex_quota_restored_upstream(live) if live is not None else None
     token = _stripped(entry.get("access_token"))
     fresh = _refresh_expired_codex_probe_token(token, entry.get("refresh_token"))
     if fresh:

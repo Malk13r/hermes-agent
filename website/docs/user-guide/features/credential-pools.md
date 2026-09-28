@@ -244,6 +244,8 @@ without a Codex credential until you run `hermes auth add openai-codex` in *that
 interactively. Profiles that should share one login can point at the same `HERMES_HOME` instead of
 each holding a copy of a single-use refresh token.
 
+A profile that borrows the root's Codex login never writes a local copy, not even an empty one: when the root's grant is rejected for good, the root's pool entry is marked `dead` for every profile and the profile keeps borrowing. Sign in once at the root (`hermes auth add openai-codex` without `-p`) and every borrowing profile picks the new login up.
+
 **A cooling-down or dead credential is not a blank install.** When a configured profile starts the
 CLI while its only credential is benched or quarantined, startup prints the failure and, for a bench,
 the remaining cooldown (or the `hermes auth add <provider>` re-login for a dead one) — the first-run
@@ -319,7 +321,7 @@ This means subagents benefit from the same rate-limit resilience as the parent, 
 
 The credential pool uses a threading lock for all state mutations (`select()`, `mark_exhausted_and_rotate()`, `try_refresh_current()`, `mark_used()`). This ensures safe concurrent access when the gateway handles multiple chat sessions simultaneously.
 
-Across processes (many subagents, a gateway plus a CLI, cron jobs), OAuth refreshes are serialized through a file lock on `auth.json`. When one shared OAuth grant expires under many concurrent processes, exactly one process performs the refresh; the others detect that the on-disk token no longer matches the one that failed and adopt it instead of rotating the single-use refresh token again. A process that loses the lock race keeps its entry healthy and retries — lock contention is never recorded as a credential failure.
+Across processes (many subagents, a gateway plus a CLI, cron jobs), OAuth refreshes are serialized through a file lock on `auth.json`. When one shared OAuth grant expires under many concurrent processes, exactly one process performs the refresh; the others detect that the on-disk token no longer matches the one that failed and adopt it instead of rotating the single-use refresh token again. A process that loses the lock race keeps its entry healthy and retries — lock contention is never recorded as a credential failure. A named profile that borrows the root's Codex login (it has no `openai-codex` login of its own) also takes the root `auth.json` lock and re-reads the root's stored token under it, so refreshes serialize across profiles too and the rotated pair is written back to the root only.
 
 ## Architecture
 

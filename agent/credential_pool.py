@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
+from agent.credential_pool_borrowed_grant import CredentialPoolBorrowedGrantMixin, codex_borrowed_root
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 
 import logging
@@ -979,7 +980,7 @@ class _RefreshDone(Exception):
         self.result = result
 
 
-class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin):
+class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin, CredentialPoolBorrowedGrantMixin):
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
@@ -1485,10 +1486,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # ``invalid_grant`` (for Anthropic sources other than claude_code
         # there was no recovery path at all). Serialize through the shared
         # cross-process auth-store flock; a waiter's in-lock re-sync picks up
-        # the winner's rotated token and skips the POST.
-        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
+        # the winner's rotated token and skips the POST. A Codex grant borrowed
+        # from root also holds ROOT's lock: other profiles share the grant.
+        with self._single_use_refresh_lock() as borrowed_root:
             if self.provider == "openai-codex":
-                synced = self._sync_entry_from_auth_store(entry)
+                # Borrowed: root's row first — its ``last_refresh`` lets the singleton
+                # sync refuse a write-through that lagged behind the row.
+                synced = entry if borrowed_root is None else self._sync_borrowed_codex_row(entry, borrowed_root)
+                synced = self._sync_entry_from_auth_store(synced)
+                if borrowed_root is not None and synced.last_status == STATUS_DEAD:
+                    return None  # the owner's grant is proven dead and no re-login followed
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
                     return synced
                 return self._refresh_entry_impl(synced, force=force)
@@ -1771,6 +1778,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             # re-seed the revoked credentials, and drop singleton-seeded
             # entries from the pool (mirrors the Nous quarantine path).
             if getattr(auth_mod, terminal_fn_name)(exc):
+                if self.provider == "openai-codex" and codex_borrowed_root() is not None:
+                    # Root owns this grant. Record DEAD on root's shared row (update-only) so every
+                    # borrower stops redeeming it; never write a token-less local shadow — it would
+                    # hide root from this profile and turn the owner's one re-login into a second.
+                    logger.warning(
+                        "Codex OAuth refresh token borrowed from the root profile is terminally "
+                        "invalid (%s); the credential leaves rotation. Re-authenticate the root "
+                        "profile with 'hermes auth add openai-codex'.", exc)
+                    self._mark_dead_refresh_grant(entry, exc)
+                    return None
                 # WARNING, not debug: this is the moment a login is lost. At the default log level a
                 # silent quarantine looked like "I logged in once and Hermes keeps failing" (#113023).
                 logger.warning(
@@ -1900,20 +1917,29 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         if not token:
             return False
         try:
-            # An exhausted entry is skipped by the refresh chain, so its stored token is usually
-            # expired by probe time (401 -> None -> cooldown kept, #89415): refresh it first.
-            fresh = auth_mod._refresh_expired_codex_probe_token(token, entry.refresh_token)
-            if fresh:
-                # Persist the rotated pair on both sides the way ``_refresh_entry`` does:
-                # ``last_refresh`` plus the singleton write-back, or the next selection's
-                # auth-store sync re-adopts the consumed pair from ``providers.openai-codex``
-                # and clears the cooldown with it.
-                entry = self._adopt(
-                    entry, access_token=fresh["access_token"], refresh_token=fresh["refresh_token"],
-                    last_refresh=fresh.get("last_refresh") or entry.last_refresh,
-                )
-                self._sync_device_code_entry_to_auth_store(entry)
-                token = entry.access_token or token
+            # A borrowed grant is refreshed under root's lock against root's current row, like
+            # ``_refresh_entry``; a locally owned one keeps its historical unlocked path.
+            with self._single_use_refresh_lock(local_lock=False) as borrowed_root:
+                if borrowed_root is not None:
+                    synced = self._sync_borrowed_codex_row(entry, borrowed_root)
+                    if synced is entry:
+                        synced = self._sync_entry_from_auth_store(entry)
+                    if synced is not entry:
+                        return False  # a peer rotated or retired it; the next selection resyncs
+                # An exhausted entry is skipped by the refresh chain, so its stored token is usually
+                # expired by probe time (401 -> None -> cooldown kept, #89415): refresh it first.
+                fresh = auth_mod._refresh_expired_codex_probe_token(token, entry.refresh_token)
+                if fresh:
+                    # Persist the rotated pair on both sides the way ``_refresh_entry`` does:
+                    # ``last_refresh`` plus the singleton write-back, or the next selection's
+                    # auth-store sync re-adopts the consumed pair from ``providers.openai-codex``
+                    # and clears the cooldown with it.
+                    entry = self._adopt(
+                        entry, access_token=fresh["access_token"], refresh_token=fresh["refresh_token"],
+                        last_refresh=fresh.get("last_refresh") or entry.last_refresh,
+                    )
+                    self._sync_device_code_entry_to_auth_store(entry)
+                    token = entry.access_token or token
             return bool(auth_mod._probe_codex_quota_restored(token, base_url=entry.base_url))
         except Exception:
             logger.debug("Codex quota-restored probe failed", exc_info=True)
