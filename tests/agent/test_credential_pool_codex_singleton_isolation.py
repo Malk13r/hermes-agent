@@ -15,6 +15,9 @@ import pytest
 
 import hermes_cli.auth as auth_mod
 from agent.credential_pool import load_pool
+from tests.network_guard import no_external_network  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("no_external_network")
 
 
 def _jwt(account: str, sub: str, exp: float) -> str:

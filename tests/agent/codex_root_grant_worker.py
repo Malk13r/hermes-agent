@@ -119,12 +119,30 @@ def _inject_fault(spec: dict) -> None:
     * ``marker`` — every root save fails, so the pre-POST pending marker cannot be written;
     * ``commit`` — the first root save (the marker) succeeds, every later one fails;
     * ``crash`` — the process dies (``os._exit``) right after the endpoint answered the POST;
-    * ``ambiguous`` — the endpoint rotates, then the client sees a network error.
+    * ``ambiguous`` — the endpoint rotates, then the client sees a network error;
+    * ``status_429`` / ``status_503`` — the endpoint rotates, then answers 429 / 503 (the worst
+      case a client cannot tell apart from a refusal that rotated nothing);
+    * ``unsent`` — the connection cannot be opened: the request never leaves the host.
 
     Profile saves are untouched."""
     import hermes_cli.auth as auth_mod
 
     fault = spec.get("fault")
+    if fault == "unsent":
+        import httpx
+
+        def refuse_connect(self, url, headers=None, data=None):
+            raise httpx.ConnectError("injected: connection refused before the request was sent")
+
+        _FakeTokenEndpoint.post = refuse_connect
+    elif fault in ("status_429", "status_503"):
+        real_post = _FakeTokenEndpoint.post
+
+        def post_then_status(self, url, headers=None, data=None):
+            real_post(self, url, headers=headers, data=data)
+            return _Response(int(fault.rsplit("_", 1)[1]), {"error": {"code": "server_busy"}})
+
+        _FakeTokenEndpoint.post = post_then_status
     if fault in ("marker", "commit"):
         real_save = auth_mod._save_auth_store
         root_auth = (Path(spec["expected_root"]) / "auth.json").resolve()
@@ -170,9 +188,33 @@ def _singleton(spec: dict) -> dict:
         creds = resolve_codex_runtime_credentials()
     except AuthError as exc:
         return {"token": None, "error": exc.code}
-    except OSError as exc:  # the ``ambiguous`` fault: a network error, not an auth verdict
+    except Exception as exc:  # a transport error, not an auth verdict
         return {"token": None, "error": type(exc).__name__}
     return {"token": fp(creds.get("api_key")), "source": creds.get("source")}
+
+
+def _force_refresh(spec: dict) -> dict:
+    """A forced pool refresh of the selected row (what a 401 on inference triggers)."""
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    _await_go(spec)
+    entry = pool.select()
+    refreshed = pool.try_refresh_matching(credential_id=entry.id) if entry else None
+    return {"token": fp(refreshed.access_token) if refreshed else None}
+
+
+def _stale_mark(spec: dict) -> dict:
+    """A LONG-LIVED pool: loads and selects, sleeps while a peer rotates the row, then records an
+    inference 429 on its stale in-memory row (a status-only write that persists every row)."""
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.select()
+    _await_go(spec)
+    pool.mark_exhausted_and_rotate(status_code=429, credential_id=entry.id)
+    live = next(e for e in pool.entries() if e.id == entry.id)
+    return {"memory_rt": fp(live.refresh_token)}
 
 
 def _relogin(spec: dict) -> dict:
@@ -213,7 +255,7 @@ def _inspect(spec: dict) -> dict:
 
 
 _TASKS = {"pool": _pool, "singleton": _singleton, "relogin": _relogin, "add_entry": _add_entry,
-          "inspect": _inspect}
+          "inspect": _inspect, "force_refresh": _force_refresh, "stale_mark": _stale_mark}
 
 
 def main() -> None:

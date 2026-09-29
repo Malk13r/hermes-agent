@@ -462,15 +462,49 @@ def _codex_refresh_failure_error(response: "httpx.Response") -> AuthError:
     return _codex_err(message, code, relogin=relogin_required)
 
 
+def _codex_refresh_outcome_unknown(what: str) -> AuthError:
+    """A marked refresh whose POST may have rotated the token without Hermes learning the result."""
+    return _codex_err(
+        f"Codex token refresh outcome is unknown ({what}): the refresh token may already be spent, "
+        f"so Hermes will not present it again. Run `{_codex_relogin_command()}` at the root profile.",
+        CODEX_REFRESH_OUTCOME_UNCERTAIN, relogin=True)
+
+
+def _codex_refresh_never_sent() -> tuple:
+    """Transport errors raised only while opening the connection, before any byte of the request
+    is written (a function: ``httpx`` is imported lazily). A fresh client per refresh means no
+    reused connection can fail mid-request under these names."""
+    return (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+def _codex_refresh_response_error(response: "httpx.Response", *, marked: bool) -> AuthError:
+    """Shape a non-200 refresh answer. Only a 4xx REJECTION (an auth error the endpoint states)
+    proves the token was not rotated; with a pending marker (*marked*) a 429, a 5xx or any other
+    answer leaves the outcome unknown, and saying "still valid, retry later" would be false."""
+    if response.status_code == 429:
+        # Quota exhaustion on the token endpoint: re-auth cannot lift a quota cap, so classify
+        # distinctly from auth failures ("retry later").
+        error = _codex_quota_exhausted_error(_parse_retry_after_seconds(getattr(response, "headers", None)))
+    else:
+        error = _codex_refresh_failure_error(response)
+    rejected = 400 <= response.status_code < 500 and response.status_code != 429 and error.relogin_required
+    if marked and not rejected:
+        return _codex_refresh_outcome_unknown(f"HTTP {response.status_code} from the token endpoint")
+    return error
+
+
 def refresh_codex_oauth_pure(
     access_token: str, refresh_token: str, *, timeout_seconds: float = 20.0,
-    before_post: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+    before_post: Optional[Callable[[], Optional[Callable[[], None]]]] = None) -> Dict[str, Any]:
     """Refresh Codex OAuth tokens without mutating Hermes auth state.
 
     Every Codex redemption funnels through here, so this is where a token whose earlier redemption
     never recorded its outcome is refused (``codex_refresh_outcome_uncertain``). *before_post* runs
-    after that check and immediately before the POST (a borrowed grant's durable pending marker);
-    if it raises, nothing is sent.
+    after that check and immediately before the POST (the owning store's durable pending marker);
+    if it raises, nothing is sent. It may return a retraction, run only when the connection could
+    not be opened (``_codex_refresh_never_sent``). Once a marker is written, every other failure
+    — a 429 or 5xx answer, a transport error after connecting, an unusable 200 body — is reported
+    as ``codex_refresh_outcome_uncertain``: the endpoint may have rotated the token anyway.
     """
     from agent.credential_pool_borrowed_grant import (
         codex_refresh_outcome_uncertain, log_codex_refresh_outcome_uncertain)
@@ -485,29 +519,38 @@ def refresh_codex_oauth_pure(
             "Codex refresh token has an unrecorded earlier redemption; "
             f"run `{_codex_relogin_command()}` at the root profile.",
             CODEX_REFRESH_OUTCOME_UNCERTAIN, relogin=True)
-    if before_post is not None:
-        before_post()
+    marked = before_post is not None
     with _codex_http_client(
         timeout=httpx.Timeout(max(5.0, float(timeout_seconds))),
         headers={"Accept": "application/json", "User-Agent": CODEX_OAUTH_USER_AGENT}) as client:
-        response = client.post(
-            CODEX_OAUTH_TOKEN_URL, headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "grant_type": "refresh_token", "refresh_token": refresh_token,
-                "client_id": CODEX_OAUTH_CLIENT_ID})
-    if response.status_code == 429:
-        # Quota exhaustion on the token endpoint: the refresh token is still valid and re-auth
-        # cannot lift a quota cap, so classify distinctly from auth failures ("retry later").
-        raise _codex_quota_exhausted_error(
-            _parse_retry_after_seconds(getattr(response, "headers", None)))
+        retract = before_post() if marked else None
+        try:
+            response = client.post(
+                CODEX_OAUTH_TOKEN_URL, headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "refresh_token", "refresh_token": refresh_token,
+                    "client_id": CODEX_OAUTH_CLIENT_ID})
+        except _codex_refresh_never_sent():
+            if retract is not None:
+                retract()
+            raise
+        except Exception as exc:
+            if not marked:
+                raise
+            raise _codex_refresh_outcome_unknown(f"{type(exc).__name__} after connecting") from exc
     if response.status_code != 200:
-        raise _codex_refresh_failure_error(response)
-    refresh_payload, refreshed_access = _refresh_payload_access_token(
-        response, provider="openai-codex", invalid_response=None,
-        invalid_json=("Codex token refresh returned invalid JSON.", "codex_refresh_invalid_json"),
-        missing_access=(
-            "Codex token refresh response was missing access_token.",
-            "codex_refresh_missing_access_token"))
+        raise _codex_refresh_response_error(response, marked=marked)
+    try:
+        refresh_payload, refreshed_access = _refresh_payload_access_token(
+            response, provider="openai-codex", invalid_response=None,
+            invalid_json=("Codex token refresh returned invalid JSON.", "codex_refresh_invalid_json"),
+            missing_access=(
+                "Codex token refresh response was missing access_token.",
+                "codex_refresh_missing_access_token"))
+    except AuthError as exc:
+        if not marked:
+            raise
+        raise _codex_refresh_outcome_unknown("HTTP 200 without a usable token") from exc
     updated = {
         "access_token": refreshed_access, "refresh_token": refresh_token.strip(),
         "last_refresh": _utc_now_z()}

@@ -19,6 +19,9 @@ import pytest
 import hermes_cli.auth as auth
 import hermes_cli.auth_codex as auth_codex
 from hermes_cli.auth import AuthError, _refresh_codex_auth_tokens, resolve_codex_runtime_credentials
+from tests.network_guard import no_external_network  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("no_external_network")
 
 STALE = {"access_token": "stale-access", "refresh_token": "stale-refresh"}
 

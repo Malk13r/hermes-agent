@@ -30,6 +30,7 @@ def _pool(provider: str) -> CredentialPool:
     pool._current_id = None
     pool._max_concurrent = 2
     pool._unmatched_rotation_streak = 0
+    pool._codex_seen_tokens = {}  # __new__ bypasses Codex's persisted-row CAS initialisation
     pool.provider = provider
     return pool
 

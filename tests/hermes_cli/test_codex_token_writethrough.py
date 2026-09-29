@@ -14,6 +14,9 @@ import httpx
 import pytest
 
 from hermes_cli import auth, auth_codex
+from tests.network_guard import no_external_network  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("no_external_network")
 
 
 def _pair(prefix: str) -> dict:

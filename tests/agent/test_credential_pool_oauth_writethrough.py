@@ -31,6 +31,9 @@ from agent.credential_pool import (
 )
 from hermes_cli import auth as A
 import hermes_cli.auth_codex as auth_codex
+from tests.network_guard import no_external_network  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("no_external_network")
 
 
 def _write_store(path, store):

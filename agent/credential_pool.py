@@ -5,8 +5,8 @@ from __future__ import annotations
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 from agent.credential_pool_borrowed_grant import (
     BorrowedRootUnavailable, CredentialPoolBorrowedGrantMixin, clear_codex_refresh_pending, codex_grant_owner,
-    codex_own_row_moved_on, codex_token_is_held, codex_token_store, mark_codex_refresh_pending,
-    record_codex_terminal_verdict,
+    codex_own_row_moved_on, codex_row_tokens, codex_token_is_held, codex_token_store, mark_codex_refresh_pending,
+    persist_own_codex_pool_rows, record_codex_terminal_verdict,
 )
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 
@@ -863,13 +863,14 @@ def _borrowed_single_use_pool_root() -> Optional[Path]:
 def _update_root_pool_rows(
     provider: str, payloads: List[Dict[str, Any]], global_path: Path,
     *, status_cleared_ids: Optional[Iterable[str]] = None,
-) -> None:
+) -> Dict[str, Dict[str, Any]]:
     """UPDATE-ONLY merge of *payloads* into the root store's rows for *provider*.
 
     A borrower may refresh the root's rows (rotation, cooldown state) but
     never add or delete them — the root owns their lifecycle. In particular a
     profile's singleton-prune (it has no ``.anthropic_oauth.json`` of its own)
     must not delete the root grant, so ``removed_ids`` is ignored by callers.
+    Returns root's rows by id as they stand after the merge.
     """
     with _auth_store_lock(target_path=global_path):
         store = _load_auth_store(global_path)
@@ -905,6 +906,7 @@ def _update_root_pool_rows(
         if changed:
             pool[provider] = merged
             _save_auth_store(store, target_path=global_path)
+        return {r["id"]: r for r in merged if isinstance(r, dict) and r.get("id")}
 
 
 def persist_pool_entries(
@@ -913,7 +915,8 @@ def persist_pool_entries(
     *,
     removed_ids: Optional[Iterable[str]] = None,
     status_cleared_ids: Optional[Iterable[str]] = None,
-) -> None:
+    seen_tokens: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Dict[str, Any]]]:
     """Persist a provider's pool rows to the store that OWNS them.
 
     A named profile that sees a single-use-refresh provider (Anthropic,
@@ -923,15 +926,20 @@ def persist_pool_entries(
     pair only to its own file, and root plus every sibling die with
     ``invalid_grant`` (#100339). Such rows are written back to the root store
     (under the root lock); everything else goes to the active store.
+
+    Codex rows are compare-and-set on their refresh token against *seen_tokens* (what the writer
+    last read) and the rows as persisted come back by id so the pool can adopt a peer's rotation;
+    other providers return None.
     """
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
         global_path = _borrowed_single_use_pool_root()
         if global_path is not None:
             try:
-                _update_root_pool_rows(
+                rows = _update_root_pool_rows(
                     provider, payloads, global_path,
                     status_cleared_ids=status_cleared_ids,
                 )
+                return rows if provider == "openai-codex" else None
             except Exception as exc:
                 # Fail closed on the FORK, not on the save: never fall back to
                 # writing a local copy (that IS the bug). The in-memory pool
@@ -941,10 +949,14 @@ def persist_pool_entries(
                     "not materializing a profile-local copy",
                     provider, exc,
                 )
-            return
+            return None
+    if provider == "openai-codex":
+        return persist_own_codex_pool_rows(
+            payloads, removed_ids=removed_ids, status_cleared_ids=status_cleared_ids, seen=seen_tokens)
     write_credential_pool(
         provider, payloads, removed_ids=removed_ids, status_cleared_ids=status_cleared_ids,
     )
+    return None
 
 
 # --- Per-provider singleton refresh plumbing -------------------------------
@@ -999,6 +1011,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin,
         # Ids of rows read via the global-root fallback (single-use OAuth
         # providers only); set by load_pool(), consumed by add_entry().
         self._borrowed_root_ids: Set[str] = set()
+        # Codex: each row's refresh token as this pool last saw it on disk — the compare-and-set
+        # base of every write (``persist_own_codex_pool_rows``); load_pool() sets the raw disk view.
+        self._codex_seen_tokens: Dict[str, str] = (
+            codex_row_tokens(e.to_dict() for e in entries) if provider == "openai-codex" else {})
         self._strategy = get_pool_strategy(provider)
         # RLock: _replace_entry/_persist self-acquire it so the DEFERRED
         # single-use-token refresh path (network I/O outside the lock by
@@ -1127,12 +1143,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin,
     ) -> None:
         # Self-locking: snapshotting self._entries must not race a rotation.
         with self._lock:
-            persist_pool_entries(
+            persisted = persist_pool_entries(
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
                 status_cleared_ids=status_cleared_ids,
+                seen_tokens=self._codex_seen_tokens if self.provider == "openai-codex" else None,
             )
+            if self.provider == "openai-codex" and isinstance(persisted, dict):
+                self._absorb_codex_rows(persisted)
 
     def _adopt(self, entry: PooledCredential, *, persist: bool = True, **updates: Any) -> PooledCredential:
         """``replace(entry, **updates)``, swap it into the pool, optionally persist."""
@@ -1512,15 +1531,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin,
     def _refresh_codex_entry_locked(
         self, entry: PooledCredential, borrowed_root: Optional[Path], *, force: bool,
     ) -> Optional[PooledCredential]:
-        # Borrowed: root's row first — its ``last_refresh`` lets the singleton
-        # sync refuse a write-through that lagged behind the row.
-        synced = entry if borrowed_root is None else self._sync_borrowed_codex_row(entry, borrowed_root)
+        # The persisted row first (root's when borrowed, else this profile's own): a long-lived pool
+        # adopts a peer's rotation or verdict, and the row's ``last_refresh`` lets the singleton
+        # sync refuse a write-through that lagged behind it.
+        synced = self._sync_codex_row_from_disk(entry)
         synced = self._sync_entry_from_auth_store(synced)
         if borrowed_root is not None and not codex_token_is_held(borrowed_root, synced.refresh_token, synced.id):
             return None  # a peer spent or retired this token (e.g. recorded it dead): never replay it
         owner = codex_grant_owner(borrowed_root, synced.refresh_token, synced.id)
-        if owner is not None and synced.last_status == STATUS_DEAD:
-            return None  # the owner's grant is proven dead and no re-login followed
+        if synced.last_status == STATUS_DEAD and (owner is not None or synced is not entry):
+            return None  # the grant is proven dead (a peer's verdict) and no re-login followed
         if synced is not entry and not force and not self._entry_needs_refresh(synced):
             return synced
         # The OWNING store (root when borrowed, else this profile's own — root itself in classic
@@ -1998,15 +2018,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin,
             needs_refresh = _codex_access_token_is_expiring(token, 0)
             with self._single_use_refresh_lock(local_lock=needs_refresh) as borrowed_root:
                 owner = None
-                if borrowed_root is not None:
-                    synced = self._sync_borrowed_codex_row(entry, borrowed_root)
+                if borrowed_root is not None or needs_refresh:
+                    synced = self._sync_codex_row_from_disk(entry)
                     if synced is entry:
                         synced = self._sync_entry_from_auth_store(entry)
-                    if synced is not entry or not codex_token_is_held(borrowed_root, entry.refresh_token, entry.id):
+                    if synced is not entry or (borrowed_root is not None and not codex_token_is_held(
+                            borrowed_root, entry.refresh_token, entry.id)):
                         return False  # a peer rotated or retired it; the next selection resyncs
                 if needs_refresh:
-                    if borrowed_root is None and self._sync_entry_from_auth_store(entry) is not entry:
-                        return False  # a peer rotated it; the next selection resyncs
                     owner = codex_token_store(borrowed_root, entry.refresh_token, entry.id)
                     if owner is None and codex_own_row_moved_on(entry.id, entry.refresh_token):
                         return False
@@ -3169,14 +3188,13 @@ def load_pool(provider: str) -> CredentialPool:
             )
         changed |= _normalize_pool_priorities(provider, entries)
 
+    pool = CredentialPool(provider, entries)
+    if provider == "openai-codex":
+        # The rows as read, not the seeded view: a peer's rotation since that read wins the write.
+        pool._codex_seen_tokens = codex_row_tokens(raw_entries)
     if changed:
         new_ids = {entry.id for entry in entries}
-        persist_pool_entries(
-            provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
-            removed_ids=disk_ids - new_ids,
-        )
-    pool = CredentialPool(provider, entries)
+        pool._persist(removed_ids=list(disk_ids - new_ids))
     # Remember the root's borrowed rows so a later ``add_entry`` in this
     # profile leaves them out of the profile's own store (#100339).
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):

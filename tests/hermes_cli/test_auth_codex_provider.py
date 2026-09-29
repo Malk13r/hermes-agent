@@ -14,6 +14,9 @@ from hermes_cli.auth import (
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
 )
+from tests.network_guard import no_external_network  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("no_external_network")
 
 
 def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):

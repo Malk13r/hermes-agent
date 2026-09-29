@@ -24,6 +24,9 @@ from hermes_cli.auth import (
     clear_codex_pool_quota_cooldowns,
     resolve_codex_runtime_credentials,
 )
+from tests.network_guard import no_external_network  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("no_external_network")
 
 
 @pytest.fixture(autouse=True)

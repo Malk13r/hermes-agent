@@ -26,6 +26,9 @@ from pathlib import Path
 import pytest
 
 from tests.agent.codex_root_grant_worker import CRASH_EXIT, fake_jwt, fp
+from tests.network_guard import no_external_network  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("no_external_network")
 
 REPO = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).with_name("codex_root_grant_worker.py")
@@ -320,13 +323,19 @@ def test_unwritable_pending_marker_means_zero_post_and_is_not_sticky(lab, task, 
     _assert_single_rotation_adopted(lab, lab.run(_EVERY_PATH[:5]))
 
 
+def _held_refresh_tokens(singleton: dict, rows: list) -> set:
+    return {r.get("refresh_token") for r in rows} | {(singleton.get("tokens") or {}).get("refresh_token")} - {None}
+
+
 @pytest.mark.parametrize("task", ["pool", "singleton"])
-@pytest.mark.parametrize("fault", ["commit", "crash", "ambiguous"])
+@pytest.mark.parametrize("fault", ["commit", "crash", "ambiguous", "status_429", "status_503"])
 def test_unrecorded_redemption_is_never_replayed_on_any_path_in_any_profile(lab, fault, task):
     """The POST happened but root never learned its outcome (commit failed, the process died, the
-    connection dropped). Root still holds the spent token; its durable pending marker makes every
-    later pool AND singleton attempt in every profile — root included — fail closed with zero POST,
-    so the family is never revoked, and the owner's one ``hermes auth add`` recovers every path."""
+    connection dropped, the endpoint answered 429/503 after rotating). Root still holds only the
+    spent token; its durable pending marker makes every later pool AND singleton attempt in every
+    profile — root included — fail closed with zero POST, so the family is never revoked, and the
+    owner's one ``hermes auth add`` recovers every path. The first failure already says so: an
+    answer that does not prove the token unspent is never reported as "still valid, retry"."""
     _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
     _borrowing_profiles(lab)
     lab.serve(valid={"root": "root-rt-0"})
@@ -334,9 +343,10 @@ def test_unrecorded_redemption_is_never_replayed_on_any_path_in_any_profile(lab,
     first = lab.run_one("assistant", task, fault=fault)
 
     assert first.get("token") is None
+    if task == "singleton" and fault != "crash":
+        assert first["error"] == "codex_refresh_outcome_uncertain"
     assert [p["token"] for p in lab.endpoint()["presented"]] == ["root-rt-0"]
-    singleton, rows = _root_codex(lab)
-    assert singleton["tokens"]["refresh_token"] == rows[0]["refresh_token"] == "root-rt-0"  # never torn
+    assert _held_refresh_tokens(*_root_codex(lab)) == {"root-rt-0"}  # never torn, never replaced
 
     later = lab.run(_EVERY_PATH)
     later += lab.run(_EVERY_PATH)  # a second round in fresh processes: the verdict is durable
@@ -377,6 +387,7 @@ def _same_account_cli_login(lab: Lab) -> dict:
     ("ambiguous", "pool", "mixed"), ("ambiguous", "singleton", "mixed"),
     ("crash", "pool", "pool-only"), ("crash", "singleton", "singleton-only"),
     ("commit", "singleton", "singleton-only"), ("ambiguous", "pool", "pool-only"),
+    ("status_429", "pool", "pool-only"), ("status_503", "singleton", "mixed"),
 ])
 @pytest.mark.parametrize("relogin", ["add_entry", "relogin"])
 def test_root_owner_unrecorded_redemption_is_never_replayed_anywhere(lab, fault, task, layout, relogin):
@@ -394,9 +405,8 @@ def test_root_owner_unrecorded_redemption_is_never_replayed_anywhere(lab, fault,
 
     assert first.get("token") is None
     assert [p["token"] for p in lab.endpoint()["presented"]] == ["root-rt-0"]
-    singleton, rows = _root_codex(lab)
-    held = [r["refresh_token"] for r in rows] + ([singleton["tokens"]["refresh_token"]] if singleton else [])
-    assert set(held) == {"root-rt-0"}  # never torn between row and singleton
+    # Never torn between row and singleton, never replaced (an immediate verdict may clear both).
+    assert _held_refresh_tokens(*_root_codex(lab)) <= {"root-rt-0"}
 
     later = lab.run(_EVERY_PATH)
     later += lab.run(_EVERY_PATH)
@@ -639,3 +649,83 @@ def test_unopenable_root_lock_is_an_unavailable_credential_not_a_crash(lab):
     assert lab.endpoint()["presented"] == []
     _, rows = _root_codex(lab)
     assert rows[0].get("last_status") in (None, "ok")
+
+
+def _pending_markers(lab: Lab, name: str = "root") -> dict:
+    store = _read_json(lab.home_of(name) / "auth.json")
+    return (store.get("refresh_outcome_pending") or {}).get("openai-codex") or {}
+
+
+@pytest.mark.parametrize("task", ["pool", "singleton"])
+@pytest.mark.parametrize("by", ["root", "assistant"], ids=["root-owner", "borrower"])
+def test_connection_never_opened_withdraws_the_marker_and_the_grant_stays_usable(lab, task, by):
+    """The one failure that PROVES the token never left the host — the connection could not be
+    opened — withdraws the pre-POST marker: the grant is not stranded behind a sign-in, and the
+    next attempt on any path presents the still-valid token exactly once."""
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"})
+
+    first = lab.run_one(by, task, fault="unsent")
+
+    assert first["token"] is None and lab.endpoint()["presented"] == []
+    assert not _pending_markers(lab)
+    assert _held_refresh_tokens(*_root_codex(lab)) == {"root-rt-0"}
+    later = lab.run([("coach", "singleton"), ("third", "singleton"), ("root", "singleton")])
+    later += lab.run([("assistant", "pool"), ("root", "pool")])
+
+    endpoint = lab.endpoint()
+    assert [p["token"] for p in endpoint["presented"]] == ["root-rt-0"] and endpoint["revoked"] == []
+    assert [r["token"] for r in later] == [fp(endpoint["issued_access"]["root"])] * len(later)
+    assert _held_refresh_tokens(*_root_codex(lab)) == {"root-rt-1"}
+
+
+def _manual_row_store(family: str) -> dict:
+    """Pool-only layout: one ``hermes auth add`` row and no singleton to re-seed it from."""
+    return {"version": 1, "providers": {}, "credential_pool": {"openai-codex": [{
+        "id": f"{family}mn", "label": "manual", "auth_type": "oauth", "priority": 0,
+        "source": "manual:device_code", "base_url": CODEX_BASE_URL,
+        "last_refresh": "2026-09-01T00:00:00Z", **_grant(family, expired=False)}]}}
+
+
+@pytest.mark.parametrize("owner,layout", [
+    ("root", "mixed"), ("root", "pool-only"), ("solo", "mixed"), ("solo", "pool-only"),
+    ("borrowed", "mixed"), ("borrowed", "pool-only"),
+])
+def test_long_lived_pool_status_write_never_rolls_back_a_peer_rotation(lab, owner, layout):
+    """A long-lived pool loaded the row at T0; a peer then rotated it to T1 and cleared its marker.
+    The stale pool records an inference 429 — a status-only write that persists its whole snapshot.
+    T1 must stay on disk (a rolled-back T0 is a spent token the next process would present and
+    revoke the family with), the live pool must adopt T1 without a reload, and a later refresh
+    presents T1 once."""
+    family = "solo" if owner == "solo" else "root"
+    store = (_codex_store(_grant(family, expired=False), pool_row_id=f"{family}dc")
+             if layout == "mixed" else _manual_row_store(family))
+    if owner == "solo":
+        lab.profile("solo", auth=store)
+        stale, peer, later = "solo", "solo", "solo"
+    else:
+        _write_json(lab.root / "auth.json", store)
+        _borrowing_profiles(lab)
+        stale, peer, later = ("assistant", "coach", "third") if owner == "borrowed" else ("root",) * 3
+    lab.serve(valid={family: f"{family}-rt-0"})
+    rotated = f"{family}-rt-1"
+
+    (stale_result,) = lab.run([(stale, "stale_mark")],
+                              before_go=lambda: lab.run_one(peer, "force_refresh"))
+
+    rows_home = lab.home_of("solo" if owner == "solo" else "root")
+    rows = _read_json(rows_home / "auth.json")["credential_pool"]["openai-codex"]
+    assert [r["refresh_token"] for r in rows] == [rotated]
+    assert stale_result["memory_rt"] == fp(rotated)
+    assert not _pending_markers(lab, "solo" if owner == "solo" else "root")
+
+    final = lab.run_one(later, "force_refresh")
+
+    endpoint = lab.endpoint()
+    assert [p["token"] for p in endpoint["presented"]] == [f"{family}-rt-0", rotated]
+    assert endpoint["revoked"] == []
+    assert final["token"] == fp(endpoint["issued_access"][family])
+    if owner == "borrowed":
+        for name in ("assistant", "coach", "third"):
+            assert not lab.profile_has_codex(name), name

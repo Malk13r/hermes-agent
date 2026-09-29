@@ -20,6 +20,11 @@ Ownership is decided per TOKEN, not per profile: the grant is root's when root's
 refresh token about to be spent and the profile's own singleton does not. A profile may own its
 singleton while reading root's rows (a profile-local login writes no rows), or own rows while
 reading root's singleton; disk shape alone misattributes both.
+
+Every ordinary pool write of Codex rows — root-owned, profile-owned or borrowed — is a
+compare-and-set of the refresh token against the one that pool last saw on disk
+(``persist_codex_pool_entries``): a long-lived pool that marks a row exhausted after a peer
+rotated it must never write the spent token back. The pool adopts the peer's row instead.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import hermes_cli.auth as auth_mod
 
@@ -106,12 +111,14 @@ def codex_refresh_outcome_uncertain(refresh_token: Optional[str]) -> bool:
     return any(key in _pending_markers(cp._load_auth_store(path)) for path in paths)
 
 
-def mark_codex_refresh_pending(root: Path, refresh_token: str) -> None:
+def mark_codex_refresh_pending(root: Path, refresh_token: str) -> Callable[[], None]:
     """Durably record at root, BEFORE the POST, that *refresh_token* is being redeemed; raises
     ``BorrowedRootUnavailable`` when root cannot be written, and the caller must then not POST.
     Caller holds root's lock.
 
     Markers for tokens root no longer holds (the owner signed in again) are dropped here.
+    Returns the retraction ``refresh_codex_oauth_pure`` runs when the request provably never
+    left this host.
     """
     from agent import credential_pool as cp
     from hermes_constants import get_hermes_home
@@ -130,6 +137,21 @@ def mark_codex_refresh_pending(root: Path, refresh_token: str) -> None:
         logger.warning("Codex OAuth refresh skipped: the pending-refresh marker could not be written to "
                        "the root auth store (%s); the shared token was not presented.", exc)
         raise BorrowedRootUnavailable(str(exc)) from exc
+    return lambda: retract_codex_refresh_pending(root, refresh_token)
+
+
+def retract_codex_refresh_pending(store_path: Path, refresh_token: str) -> None:
+    """Drop *refresh_token*'s marker because its POST never left this host (no connection was
+    established, so no byte of the request was written). Only that proof may retract a marker: a
+    429/5xx, a read or write error, or a crash all leave it. A failed retraction keeps the marker."""
+    from agent import credential_pool as cp
+
+    try:
+        with cp._auth_store_lock(target_path=store_path):
+            clear_codex_refresh_pending(store_path, refresh_token)
+    except Exception as exc:
+        logger.warning("Codex OAuth: the refresh request was never sent, but its pending-refresh marker "
+                       "could not be withdrawn (%s); the token stays blocked until the next sign-in.", exc)
 
 
 def codex_borrowed_root() -> Optional[Path]:
@@ -195,6 +217,66 @@ def codex_own_row_moved_on(entry_id: str, refresh_token: Optional[str]) -> bool:
     token = _rt(refresh_token)
     return any(isinstance(r, dict) and r.get("id") == entry_id and _rt(r.get("refresh_token")) != token
                for r in _codex_rows(auth_mod._load_auth_store()))
+
+
+def codex_pool_row(entry_id: str) -> Optional[Dict[str, Any]]:
+    """Persisted row *entry_id* read straight from the store this profile's Codex pool reads: its
+    own ``auth.json`` when that has rows, else root's (``read_credential_pool``'s rule, minus the
+    mtime memo — callers compare it before a POST or a write)."""
+    from agent import credential_pool as cp
+
+    rows = _codex_rows(auth_mod._load_auth_store())
+    if not rows:
+        root = cp._guarded_global_root(auth_mod._global_auth_file_path())
+        rows = _codex_rows(cp._load_auth_store(root)) if root is not None else []
+    return next((r for r in rows if isinstance(r, dict) and r.get("id") == entry_id), None)
+
+
+def codex_row_tokens(rows: Iterable[Any]) -> Dict[str, str]:
+    """``{id: refresh_token}`` of persisted Codex pool rows: what a pool saw on disk."""
+    return {r["id"]: _rt(r.get("refresh_token")) for r in rows if isinstance(r, dict) and r.get("id")}
+
+
+def _row_write_is_own(incoming: Dict[str, Any], on_disk: Dict[str, Any], seen: Optional[str]) -> bool:
+    """Whether *incoming* may replace *on_disk*'s token material: unchanged, or changed by this
+    writer while the row still holds what the writer last saw — and not older than that row."""
+    from agent.credential_pool import _parse_absolute_timestamp
+
+    held = _rt(on_disk.get("refresh_token"))
+    if _rt(incoming.get("refresh_token")) == held:
+        return True
+    if seen is None or _rt(seen) != held:
+        return False  # a peer rotated, re-logged or retired the row after this writer read it
+    new_at, held_at = (_parse_absolute_timestamp(r.get("last_refresh")) for r in (incoming, on_disk))
+    return new_at is None or held_at is None or new_at >= held_at
+
+
+def codex_rows_cas(payloads: List[Any], disk_rows: List[Any], seen: Mapping[str, str]) -> List[Any]:
+    """*payloads* with every row whose token moved on since this writer read it replaced by the
+    row as it is on disk, status included: a verdict about a spent token says nothing about its
+    successor, and the successor must never be overwritten by the spent one."""
+    disk_by_id = {r.get("id"): r for r in disk_rows if isinstance(r, dict) and r.get("id")}
+    out = []
+    for payload in payloads:
+        row = disk_by_id.get(payload.get("id")) if isinstance(payload, dict) else None
+        out.append(payload if row is None or _row_write_is_own(payload, row, seen.get(row["id"])) else row)
+    return out
+
+
+def persist_own_codex_pool_rows(
+    payloads: List[Any], *, removed_ids: Optional[Iterable[str]] = None,
+    status_cleared_ids: Optional[Iterable[str]] = None, seen: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Write this profile's own (root's, in classic mode) Codex rows under its lock with a token
+    compare-and-set against *seen* (``codex_row_tokens`` of what the writer last read); returns
+    the rows as written, by id."""
+    from agent import credential_pool as cp
+
+    with cp._auth_store_lock():
+        payloads = codex_rows_cas(payloads, _codex_rows(auth_mod._load_auth_store()), seen or {})
+        cp.write_credential_pool(
+            CODEX_PROVIDER, payloads, removed_ids=removed_ids, status_cleared_ids=status_cleared_ids)
+    return {p["id"]: p for p in payloads if isinstance(p, dict) and p.get("id")}
 
 
 def clear_codex_refresh_pending(store_path: Path, refresh_token: str) -> None:
@@ -349,24 +431,21 @@ class CredentialPoolBorrowedGrantMixin:
                     raise BorrowedRootUnavailable(str(exc)) from exc
                 yield root
 
-    def _sync_borrowed_codex_row(self, entry, root: Path):
-        """Adopt root's persisted row for *entry* (caller holds root's lock).
+    def _sync_codex_row_from_disk(self, entry):
+        """Adopt *entry*'s persisted row — root's when borrowed, else this profile's own — when a
+        peer changed it (caller holds that store's lock).
 
-        Read straight from root's file, not the mtime memo: this is the authoritative
-        compare-before-POST. Root's row carries the peer's rotation AND its DEAD verdict; the
+        Read straight from the file, not the mtime memo: this is the authoritative
+        compare-before-POST. The row carries the peer's rotation AND its DEAD verdict; the
         caller must not redeem a token whose owner row is DEAD.
         """
         from agent import credential_pool as cp
 
-        row = next(
-            (r for r in _codex_rows(cp._load_auth_store(root)) if isinstance(r, dict) and r.get("id") == entry.id),
-            None,
-        )
-        if row is None:
+        row = codex_pool_row(entry.id)
+        if row is None or not _rt(row.get("refresh_token")):
             return entry
+        self._codex_seen_tokens[entry.id] = _rt(row.get("refresh_token"))
         stored = cp.PooledCredential.from_dict(self.provider, row)
-        if not (stored.refresh_token or "").strip():
-            return entry
         if (stored.access_token, stored.refresh_token, stored.last_status) == (
             entry.access_token, entry.refresh_token, entry.last_status,
         ):
@@ -374,8 +453,25 @@ class CredentialPoolBorrowedGrantMixin:
         self._replace_entry(entry, stored)
         return stored
 
+    def _absorb_codex_rows(self, rows: Optional[Dict[str, Dict[str, Any]]]) -> None:
+        """After a Codex pool write: adopt every row whose token a peer moved on (the compare-and-set
+        kept it), and remember what each row now holds on disk. Caller holds ``self._lock``."""
+        from agent import credential_pool as cp
+
+        for entry in list(self._entries):
+            row = (rows or {}).get(entry.id)
+            if row is None:
+                continue
+            held = _rt(row.get("refresh_token"))
+            if held and held != _rt(entry.refresh_token) and held != self._codex_seen_tokens.get(entry.id):
+                logger.info("Codex pool entry %s: adopting the row another process rotated since this "
+                            "pool loaded; the in-memory token is spent.", entry.id)
+                self._replace_entry(entry, cp.PooledCredential.from_dict(self.provider, row))
+            self._codex_seen_tokens[entry.id] = held
+
     def _commit_borrowed_rotation_or_fail(self, owner: Path, spent, updated) -> bool:
-        """Commit a POSTed rotation to root; on failure the pending marker stays and say so LOUDLY."""
+        """Commit a POSTed rotation to its owning store; on failure the pending marker stays and say
+        so LOUDLY."""
         from agent import credential_pool as cp
 
         try:
@@ -383,10 +479,14 @@ class CredentialPoolBorrowedGrantMixin:
                 owner, spent.id, spent.refresh_token, access_token=updated.access_token,
                 refresh_token=updated.refresh_token, last_refresh=updated.last_refresh,
                 clear_status=updated.last_status in (None, cp.STATUS_OK))
-            return True
         except Exception as exc:
             log_codex_rotation_unrecorded(exc)
             return False
+        # The commit rewrites the pool's row only while it held the spent token: re-read what it holds.
+        row = codex_pool_row(spent.id)
+        if row is not None:
+            self._codex_seen_tokens[spent.id] = _rt(row.get("refresh_token"))
+        return True
 
 
 def log_codex_rotation_unrecorded(exc: Exception) -> None:
