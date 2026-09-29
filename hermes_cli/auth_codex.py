@@ -18,11 +18,12 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 from hermes_cli.auth_constants import (
     _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, AuthError,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
-    CODEX_OAUTH_USER_AGENT, CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
+    CODEX_OAUTH_USER_AGENT, CODEX_RATE_LIMITED_CODE, CODEX_REFRESH_OUTCOME_UNCERTAIN,
+    CODEX_ROOT_STORE_UNAVAILABLE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
 from utils import env_float
 
 if TYPE_CHECKING:  # annotation-only; the runtime import would be a cycle
@@ -152,7 +153,7 @@ def _sync_codex_pool_entries(
 
 def _save_codex_tokens(
     tokens: Dict[str, str], last_refresh: str = None, label: str = None, *,
-    set_active: bool = True, write_through: bool = False,
+    set_active: bool = True, write_through: bool = False, settled_refresh: Optional[str] = None,
 ) -> None:
     """Save Codex OAuth tokens to the auth store the grant was resolved FROM.
 
@@ -166,7 +167,8 @@ def _save_codex_tokens(
     Only a token REFRESH passes ``write_through=True``: a fresh login or import under a profile
     is the profile's own grant and must not overwrite the root account it was borrowing.
     ``set_active=False`` stores credentials for a side tool (image gen) without making Codex the
-    active inference provider.
+    active inference provider. ``settled_refresh`` (a refresh's spent token) drops that token's
+    pre-POST pending marker in the SAME save as the rotated pair.
     """
     from hermes_cli.auth import (
         _auth_file_path, _load_auth_store, _provider_state_transaction, _same_path,
@@ -190,6 +192,9 @@ def _save_codex_tokens(
         _store_provider_state(target_store, "openai-codex", state, set_active=set_active)
         _sync_codex_pool_entries(
             target_store, tokens, last_refresh, previous_singleton_tokens=previous_singleton_tokens)
+        if settled_refresh:
+            from agent.credential_pool_borrowed_grant import _clear_pending_marker
+            _clear_pending_marker(target_store, settled_refresh)
         _save_auth_store(target_store, target_path=target_path)
 
 
@@ -218,6 +223,21 @@ def _recover_codex_tokens_from_cli(
         return None
     observed = _stripped(observed_access_token) or None
     with _provider_state_transaction("openai-codex") as (_store, state, _source):
+        from agent.credential_pool_borrowed_grant import codex_borrowed_root, codex_grant_uncertain
+        from hermes_cli.auth import _auth_file_path, _same_path
+        if (_source is not None and not _same_path(_source, _auth_file_path())) or (
+                _source is None and codex_borrowed_root() is not None):
+            # This profile borrows root's Codex login: an import would land here as a local shadow
+            # (a second account boundary) hiding root's grant and its owner's re-login.
+            logger.info("Codex CLI recovery skipped (%s): the Codex login is borrowed from the root "
+                        "profile; sign in again there.", reason)
+            return None
+        if codex_grant_uncertain(_auth_file_path()):
+            # An earlier redemption of this store's own grant never recorded its outcome: only a
+            # supervised sign-in may replace it, never a silent import of another program's login.
+            logger.warning("Codex CLI recovery refused (%s): an earlier refresh of this login never "
+                           "recorded its outcome. Run `%s` to sign in again.", reason, _codex_relogin_command())
+            return None
         stored = (state or {}).get("tokens")
         stored = stored if isinstance(stored, dict) else {}
         if (_stripped(stored.get("access_token")) or None) != observed:
@@ -443,13 +463,30 @@ def _codex_refresh_failure_error(response: "httpx.Response") -> AuthError:
 
 
 def refresh_codex_oauth_pure(
-    access_token: str, refresh_token: str, *, timeout_seconds: float = 20.0) -> Dict[str, Any]:
-    """Refresh Codex OAuth tokens without mutating Hermes auth state."""
+    access_token: str, refresh_token: str, *, timeout_seconds: float = 20.0,
+    before_post: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+    """Refresh Codex OAuth tokens without mutating Hermes auth state.
+
+    Every Codex redemption funnels through here, so this is where a token whose earlier redemption
+    never recorded its outcome is refused (``codex_refresh_outcome_uncertain``). *before_post* runs
+    after that check and immediately before the POST (a borrowed grant's durable pending marker);
+    if it raises, nothing is sent.
+    """
+    from agent.credential_pool_borrowed_grant import (
+        codex_refresh_outcome_uncertain, log_codex_refresh_outcome_uncertain)
     from hermes_cli.auth import _nonempty_str, _utc_now_z
     del access_token  # Access token is only used by callers to decide whether to refresh.
     if not _nonempty_str(refresh_token):
         raise _codex_err(_MISSING_REFRESH_TOKEN_MSG.format(relogin=_codex_relogin_command()),
                          "codex_auth_missing_refresh_token", relogin=True)
+    if codex_refresh_outcome_uncertain(refresh_token):
+        log_codex_refresh_outcome_uncertain()
+        raise _codex_err(
+            "Codex refresh token has an unrecorded earlier redemption; "
+            f"run `{_codex_relogin_command()}` at the root profile.",
+            CODEX_REFRESH_OUTCOME_UNCERTAIN, relogin=True)
+    if before_post is not None:
+        before_post()
     with _codex_http_client(
         timeout=httpx.Timeout(max(5.0, float(timeout_seconds))),
         headers={"Accept": "application/json", "User-Agent": CODEX_OAUTH_USER_AGENT}) as client:
@@ -489,7 +526,9 @@ def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -
     finds root already rotated by its peer adopts the stored pair instead of replaying the
     consumed token. Both locks wait out a full endpoint timeout so the waiter adopts, not times out.
     """
-    from hermes_cli.auth import _provider_state_transaction, _save_codex_tokens, refresh_codex_oauth_pure
+    from hermes_cli.auth import (
+        _auth_file_path, _load_auth_store, _provider_state_transaction, _same_path, _save_codex_tokens,
+        refresh_codex_oauth_pure)
     lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), float(timeout_seconds) + 5.0)
     with _provider_state_transaction("openai-codex", lock_timeout) as (_store, state, _source):
         stored = (state or {}).get("tokens")
@@ -498,19 +537,65 @@ def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -
         if stored_at and stored_rt and stored_rt != _stripped(tokens.get("refresh_token")):
             logger.info("Codex refresh token already rotated by a peer — adopting the stored pair.")
             return {**tokens, "access_token": stored_at, "refresh_token": stored_rt}
+        spending = _stripped(tokens.get("refresh_token"))
+        borrowed = _source is not None and not _same_path(_source, _auth_file_path())
+        if borrowed and stored_rt != spending:
+            # Root no longer holds the token read before the lock (a peer in another profile
+            # recorded it dead or retired it): replaying it would revoke the family.
+            raise AuthError("Codex refresh token was retired by another process; sign in again.",
+                            provider="openai-codex", code="invalid_grant", relogin_required=True)
+        owner_store = _load_auth_store(_source) if _source is not None else _store
+        if spending and any(row.get("last_status") == "dead" and _stripped(row.get("refresh_token")) == spending
+                            for row in _codex_pool_dicts(_pool_entries(owner_store, "openai-codex") or [])):
+            # The pool already proved this grant dead (possibly from another profile): never re-present it.
+            raise AuthError("Codex refresh token was terminally rejected; sign in again.",
+                            provider="openai-codex", code="invalid_grant", relogin_required=True)
+        from agent.credential_pool_borrowed_grant import (
+            BorrowedRootUnavailable, clear_codex_refresh_pending, mark_codex_refresh_pending,
+            record_codex_terminal_verdict)
+        # The OWNING store (root when borrowed; this store — root itself in classic mode — when it
+        # holds the token) gets a durable pending marker before the POST, or nothing is sent.
+        owner_path = Path(_source) if borrowed else (_auth_file_path() if spending and stored_rt == spending else None)
+        hook = {"before_post": lambda: mark_codex_refresh_pending(owner_path, spending)} if owner_path else {}
         try:
             refreshed = refresh_codex_oauth_pure(
                 str(tokens.get("access_token", "") or ""), str(tokens.get("refresh_token", "") or ""),
-                timeout_seconds=timeout_seconds)
+                timeout_seconds=timeout_seconds, **hook)
+        except BorrowedRootUnavailable as exc:
+            raise AuthError("Codex refresh skipped: the owning auth store could not be written; "
+                            "nothing was spent.", provider="openai-codex", code=CODEX_ROOT_STORE_UNAVAILABLE,
+                            relogin_required=False) from exc
         except AuthError as exc:
             # Self-heal cross-store rotation: refresh_tokens are single-use, so when the Codex CLI
             # (or another Hermes process) rotates the shared token this frozen copy fails with a
             # relogin-required error (invalid_grant / refresh_token_reused / 401). Adopt the
             # canonical fresh token from ~/.codex/auth.json before surfacing a hard 401. Transient
             # failures (429 quota) keep relogin_required=False — the stored token is still valid —
-            # re-raise.
-            if not getattr(exc, "relogin_required", False):
+            # re-raise. An unrecorded redemption is a STOP, not a repairable 401; and a grant
+            # borrowed from root is never repaired from the external CLI (that import would land in
+            # this profile as a local shadow of another account).
+            if (not getattr(exc, "relogin_required", False) or borrowed
+                    or getattr(exc, "code", None) == CODEX_REFRESH_OUTCOME_UNCERTAIN):
+                from hermes_cli.auth import _is_terminal_codex_oauth_refresh_error
+                uncertain = getattr(exc, "code", None) == CODEX_REFRESH_OUTCOME_UNCERTAIN
+                if uncertain or (borrowed and _is_terminal_codex_oauth_refresh_error(exc)):
+                    # Record the verdict on the grant's store (root when borrowed; under its held
+                    # lock) so no path in any profile re-presents it and a pool-only re-login
+                    # (``hermes auth add``) is reached; an unknown outcome keeps its marker.
+                    try:
+                        record_codex_terminal_verdict(
+                            Path(_source) if _source is not None else _auth_file_path(), None, spending, exc,
+                            keep_marker=uncertain)
+                    except Exception as record_exc:
+                        logger.warning("Codex OAuth: could not record the refused grant (%s)", record_exc)
                 raise
+            if owner_path is not None:
+                # A definitive rejection of this store's own token: the marker has nothing left to
+                # guard, and the legitimate CLI recovery below must not read it as "uncertain".
+                try:
+                    clear_codex_refresh_pending(owner_path, spending)
+                except Exception as clear_exc:  # the marker stays: recovery below then fails closed
+                    logger.warning("Codex OAuth: could not clear the pending-refresh marker (%s)", clear_exc)
             imported = _recover_codex_tokens_from_cli(
                 f"refresh_token rejected: {getattr(exc, 'code', None) or 'auth_error'}",
                 observed_access_token=stored_at or None)
@@ -520,8 +605,35 @@ def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -
         updated_tokens = {
             **tokens, "access_token": refreshed["access_token"],
             "refresh_token": refreshed["refresh_token"]}
+        if borrowed:
+            # Root's grant: singleton + rows holding the spent token + the pending marker in ONE
+            # root save. A failure leaves the marker (STOP) and is never reported as a refresh.
+            from agent.credential_pool_borrowed_grant import (
+                commit_borrowed_codex_rotation, log_codex_rotation_unrecorded)
+            try:
+                commit_borrowed_codex_rotation(
+                    Path(_source), None, spending, access_token=refreshed["access_token"],
+                    refresh_token=refreshed["refresh_token"], last_refresh=refreshed.get("last_refresh"),
+                    clear_status=True)
+            except Exception as exc:
+                log_codex_rotation_unrecorded(exc)
+                raise AuthError("Codex token rotation could not be recorded at the root profile; sign in again.",
+                                provider="openai-codex", code=CODEX_REFRESH_OUTCOME_UNCERTAIN,
+                                relogin_required=True) from exc
+            return updated_tokens
         # Nested transaction: the per-path lock is reentrant, and it re-reads under the held locks.
-        _save_codex_tokens(updated_tokens, write_through=True)
+        # Singleton, aliasing rows and the marker's clearance land in ONE save; a failure leaves
+        # the marker (STOP) and is never reported as a refresh.
+        try:
+            _save_codex_tokens(updated_tokens, write_through=True, settled_refresh=spending if owner_path else None)
+        except Exception as exc:
+            if owner_path is None:
+                raise
+            from agent.credential_pool_borrowed_grant import log_codex_rotation_unrecorded
+            log_codex_rotation_unrecorded(exc)
+            raise AuthError("Codex token rotation could not be recorded; sign in again.",
+                            provider="openai-codex", code=CODEX_REFRESH_OUTCOME_UNCERTAIN,
+                            relogin_required=True) from exc
     return updated_tokens
 
 
@@ -748,7 +860,8 @@ def _probe_codex_quota_restored(
 
 def _refresh_expired_codex_probe_token(
     access_token: Any, refresh_token: Any, *,
-    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[Dict[str, Any]]:
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
+    before_post: Optional[Callable[[], None]] = None) -> Optional[Dict[str, Any]]:
     """Refresh an EXPIRED stored access token so the quota probe can get a real answer.
 
     Exhausted pool entries are skipped by the proactive refresh chain (#44799), so by the time
@@ -775,7 +888,7 @@ def _refresh_expired_codex_probe_token(
         if cached is not None and (now - cached[0]) < min_interval_seconds:
             return None
     try:
-        return refresh_codex_oauth_pure(token, refresh)
+        return refresh_codex_oauth_pure(token, refresh, **({"before_post": before_post} if before_post else {}))
     except Exception:
         logger.debug("Codex pre-probe token refresh failed", exc_info=True)
         with _codex_quota_probe_lock:
@@ -785,32 +898,13 @@ def _refresh_expired_codex_probe_token(
 
 def _probe_codex_pool_entry_quota_restored(entry: Dict[str, Any]) -> Optional[bool]:
     """``_probe_codex_quota_restored`` for a persisted pool entry, refreshing an expired token first."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
-    from agent.credential_pool_borrowed_grant import codex_borrowed_root
-    if codex_borrowed_root() is not None:
-        # The row belongs to root: rotating it here would redeem root's token outside root's lock
-        # and persist the new pair into a profile store that has no such row, dropping it.
-        from agent.credential_pool import load_pool
-        pool = load_pool("openai-codex")
-        live = next((e for e in pool.entries() if e.id == entry.get("id")), None)
-        return pool._codex_quota_restored_upstream(live) if live is not None else None
-    token = _stripped(entry.get("access_token"))
-    fresh = _refresh_expired_codex_probe_token(token, entry.get("refresh_token"))
-    if fresh:
-        token = fresh["access_token"]
-        try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                for disk_entry in _codex_pool_dicts(_pool_entries(auth_store, "openai-codex")):
-                    if disk_entry.get("id") == entry.get("id"):
-                        disk_entry.update(fresh)
-                        _save_auth_store(auth_store)
-                        break
-        except Exception:
-            logger.debug("Failed to persist refreshed Codex pool tokens", exc_info=True)
-    if not token:
-        return None
-    return _probe_codex_quota_restored(token, base_url=entry.get("base_url"))
+    # Refreshing the row spends a single-use token, so it goes through the pool's locked, marked,
+    # one-save path whoever owns it: an unlocked refresh here raced peers and rotated the row
+    # without the singleton it aliases (root borrowed or not), leaving a spent token behind.
+    from agent.credential_pool import load_pool
+    pool = load_pool("openai-codex")
+    live = next((e for e in pool.entries() if e.id == entry.get("id")), None)
+    return pool._codex_quota_restored_upstream(live) if live is not None else None
 
 
 def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
@@ -890,6 +984,7 @@ def _pool_codex_access_token() -> str:
     through ``read_credential_pool`` so a profile inherits the global-root pool (#34143).
     """
     from agent.credential_pool import _parse_absolute_timestamp
+    from agent.credential_pool_borrowed_grant import codex_refresh_outcome_uncertain
     from hermes_cli.auth import _nonempty_str, read_credential_pool
     try:
         for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
@@ -898,7 +993,10 @@ def _pool_codex_access_token() -> str:
             # raw reads as far-future here and as elapsed there, hiding a usable entry (#103349).
             reset_at = _parse_absolute_timestamp(entry.get("last_error_reset_at"))
             in_cooldown = reset_at is not None and reset_at > time.time()
-            if _nonempty_str(token) and not in_cooldown:
+            # A DEAD row's grant was terminally rejected, and a row whose refresh outcome is
+            # unknown awaits a supervised sign-in: neither access token is a credential.
+            if (_nonempty_str(token) and not in_cooldown and entry.get("last_status") != "dead"
+                    and not codex_refresh_outcome_uncertain(entry.get("refresh_token"))):
                 return token.strip()
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)

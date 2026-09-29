@@ -53,7 +53,9 @@ def home(tmp_path, monkeypatch):
 
 
 def _stub_refresh(monkeypatch, minted: str, minted_rt: str, posted: list) -> None:
-    def fake(access_token, refresh_token):
+    def fake(access_token, refresh_token, before_post=None):
+        if before_post is not None:
+            before_post()  # the owning store's durable pre-POST marker
         posted.append(refresh_token)
         return {"access_token": minted, "refresh_token": minted_rt, "last_refresh": _iso(time.time())}
 

@@ -133,6 +133,11 @@ ACTUAL_LOCAL_NOAUTH_PLACEHOLDER = "dummy-actual-local-api-key"
 # Upstream rate-limit / usage-quota exhaustion (HTTP 429): transient, re-authenticating cannot resolve
 # it, so it must stay distinct from missing/expired-credential errors.
 CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+# A borrowed root Codex refresh token whose earlier redemption never recorded its outcome (crash,
+# network ambiguity, failed commit): presenting it again could revoke the whole token family.
+CODEX_REFRESH_OUTCOME_UNCERTAIN = "codex_refresh_outcome_uncertain"
+# Root's auth store could not be locked or written before a borrowed refresh: nothing was spent.
+CODEX_ROOT_STORE_UNAVAILABLE = "codex_root_store_unavailable"
 
 
 class AuthError(RuntimeError):

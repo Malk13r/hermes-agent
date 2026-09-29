@@ -110,10 +110,52 @@ def _await_go(spec: dict) -> None:
         time.sleep(0.005)
 
 
+CRASH_EXIT = 9
+
+
+def _inject_fault(spec: dict) -> None:
+    """``fault`` (applied after the pool loads, before the refresh phase):
+
+    * ``marker`` — every root save fails, so the pre-POST pending marker cannot be written;
+    * ``commit`` — the first root save (the marker) succeeds, every later one fails;
+    * ``crash`` — the process dies (``os._exit``) right after the endpoint answered the POST;
+    * ``ambiguous`` — the endpoint rotates, then the client sees a network error.
+
+    Profile saves are untouched."""
+    import hermes_cli.auth as auth_mod
+
+    fault = spec.get("fault")
+    if fault in ("marker", "commit"):
+        real_save = auth_mod._save_auth_store
+        root_auth = (Path(spec["expected_root"]) / "auth.json").resolve()
+        seen = {"root_saves": 0}
+
+        def faulty_save(auth_store, target_path=None):
+            target = Path(target_path if target_path is not None else auth_mod._auth_file_path()).resolve()
+            if target == root_auth:
+                seen["root_saves"] += 1
+                if fault == "marker" or seen["root_saves"] > 1:
+                    raise OSError("injected root auth.json write failure")
+            return real_save(auth_store, target_path=target_path)
+
+        auth_mod._save_auth_store = faulty_save
+    elif fault in ("crash", "ambiguous"):
+        real_post = _FakeTokenEndpoint.post
+
+        def post_then_fail(self, url, headers=None, data=None):
+            real_post(self, url, headers=headers, data=data)
+            if fault == "crash":
+                os._exit(CRASH_EXIT)
+            raise OSError("injected connection reset after the request was sent")
+
+        _FakeTokenEndpoint.post = post_then_fail
+
+
 def _pool(spec: dict) -> dict:
     from agent.credential_pool import load_pool
 
     pool = load_pool("openai-codex")
+    _inject_fault(spec)
     _await_go(spec)
     entry = pool.select()
     return {"token": fp(entry.access_token) if entry else None, "entries": len(pool.entries())}
@@ -122,20 +164,39 @@ def _pool(spec: dict) -> dict:
 def _singleton(spec: dict) -> dict:
     from hermes_cli.auth import AuthError, resolve_codex_runtime_credentials
 
+    _inject_fault(spec)
     _await_go(spec)
     try:
         creds = resolve_codex_runtime_credentials()
     except AuthError as exc:
         return {"token": None, "error": exc.code}
+    except OSError as exc:  # the ``ambiguous`` fault: a network error, not an auth verdict
+        return {"token": None, "error": type(exc).__name__}
     return {"token": fp(creds.get("api_key")), "source": creds.get("source")}
 
 
 def _relogin(spec: dict) -> dict:
-    """The OWNER (root) signs in again: the path ``hermes auth add openai-codex`` persists."""
+    """The OWNER (root) signs in again through the singleton login (``hermes model`` persists this)."""
     from hermes_cli.auth import _save_codex_tokens
 
     _save_codex_tokens(spec["tokens"])
     return {"relogin": True}
+
+
+def _add_entry(spec: dict) -> dict:
+    """The REAL ``hermes auth add openai-codex`` command; only the OAuth browser/device step is
+    replaced by synthetic tokens (no OAuth, no network)."""
+    import argparse
+
+    import hermes_cli.auth_codex_browser as browser
+    from hermes_cli.auth_commands import auth_add_command
+
+    browser.codex_oauth_login = lambda _args: {
+        "tokens": dict(spec["tokens"]), "base_url": "https://chatgpt.com/backend-api/codex",
+        "last_refresh": "2026-09-28T00:00:00Z", "source": "device_code"}
+    auth_add_command(argparse.Namespace(provider="openai-codex", auth_type="", label="relogin",
+                                        priority=None))
+    return {"added": True}
 
 
 def _inspect(spec: dict) -> dict:
@@ -151,7 +212,8 @@ def _inspect(spec: dict) -> dict:
     }
 
 
-_TASKS = {"pool": _pool, "singleton": _singleton, "relogin": _relogin, "inspect": _inspect}
+_TASKS = {"pool": _pool, "singleton": _singleton, "relogin": _relogin, "add_entry": _add_entry,
+          "inspect": _inspect}
 
 
 def main() -> None:

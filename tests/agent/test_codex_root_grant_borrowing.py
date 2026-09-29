@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.agent.codex_root_grant_worker import fake_jwt, fp
+from tests.agent.codex_root_grant_worker import CRASH_EXIT, fake_jwt, fp
 
 REPO = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).with_name("codex_root_grant_worker.py")
@@ -131,6 +131,9 @@ class Lab:
         results = []
         for proc in procs:
             out, err = proc.communicate(timeout=120)
+            if extra.get("fault") == "crash" and proc.returncode == CRASH_EXIT:
+                results.append({"crashed": True})
+                continue
             lines = [line for line in out.splitlines() if line.startswith('{"worker"')]
             assert proc.returncode == 0 and lines, f"worker failed rc={proc.returncode}: {err[-2000:]}"
             results.append(json.loads(lines[-1])["worker"])
@@ -286,3 +289,353 @@ def test_profile_owned_grant_refreshes_locally_without_root(lab):
     assert solo["providers"]["openai-codex"]["tokens"]["refresh_token"] == "solo-rt-1"
     assert [row["refresh_token"] for row in solo["credential_pool"]["openai-codex"]] == ["solo-rt-1"]
     assert solo["credential_pool"]["openrouter"] == [OTHER_PROVIDER_ROW]
+
+
+def _root_codex(lab: Lab):
+    root = _read_json(lab.root / "auth.json")
+    singleton = (root.get("providers") or {}).get("openai-codex") or {}
+    return singleton, (root.get("credential_pool") or {}).get("openai-codex") or []
+
+
+_EVERY_PATH = [("assistant", "pool"), ("coach", "singleton"), ("third", "pool"),
+               ("coach", "pool"), ("third", "singleton"), ("root", "singleton"), ("root", "pool")]
+
+
+@pytest.mark.parametrize("task", ["pool", "singleton"])
+@pytest.mark.parametrize("by", ["assistant", "root"], ids=["borrower", "root-owner"])
+def test_unwritable_pending_marker_means_zero_post_and_is_not_sticky(lab, task, by):
+    """Root cannot record the pre-POST marker: the shared token is never presented — by a borrower
+    or by the root owner itself — root is untouched, and once root is writable again the grant
+    rotates exactly once for everyone."""
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
+    root_bytes = (lab.root / "auth.json").read_bytes()
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"})
+
+    first = lab.run([(by, task), ("coach", task)], fault="marker")
+
+    assert lab.endpoint()["presented"] == []
+    assert [r["token"] for r in first] == [None, None]
+    assert (lab.root / "auth.json").read_bytes() == root_bytes
+    _assert_single_rotation_adopted(lab, lab.run(_EVERY_PATH[:5]))
+
+
+@pytest.mark.parametrize("task", ["pool", "singleton"])
+@pytest.mark.parametrize("fault", ["commit", "crash", "ambiguous"])
+def test_unrecorded_redemption_is_never_replayed_on_any_path_in_any_profile(lab, fault, task):
+    """The POST happened but root never learned its outcome (commit failed, the process died, the
+    connection dropped). Root still holds the spent token; its durable pending marker makes every
+    later pool AND singleton attempt in every profile — root included — fail closed with zero POST,
+    so the family is never revoked, and the owner's one ``hermes auth add`` recovers every path."""
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"})
+
+    first = lab.run_one("assistant", task, fault=fault)
+
+    assert first.get("token") is None
+    assert [p["token"] for p in lab.endpoint()["presented"]] == ["root-rt-0"]
+    singleton, rows = _root_codex(lab)
+    assert singleton["tokens"]["refresh_token"] == rows[0]["refresh_token"] == "root-rt-0"  # never torn
+
+    later = lab.run(_EVERY_PATH)
+    later += lab.run(_EVERY_PATH)  # a second round in fresh processes: the verdict is durable
+
+    endpoint = lab.endpoint()
+    assert len(endpoint["presented"]) == 1 and endpoint["revoked"] == []
+    assert [r["token"] for r in later] == [None] * len(later)
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+    fresh = _grant("fresh", expired=False)
+    assert lab.run_one("root", "add_entry", tokens=fresh) == {"added": True}
+    after = lab.run(_EVERY_PATH)
+
+    assert [r["token"] for r in after] == [fp(fresh["access_token"])] * len(after)
+    assert len(lab.endpoint()["presented"]) == 1 and lab.endpoint()["revoked"] == []
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+
+def _root_layout(layout: str) -> dict:
+    store = _codex_store(_grant("root"), pool_row_id=None if layout == "singleton-only" else "rootdc")
+    if layout == "pool-only":
+        del store["providers"]["openai-codex"]
+    return store
+
+
+def _same_account_cli_login(lab: Lab) -> dict:
+    """A valid external Codex CLI login for the SAME account as root (so identity checks pass)."""
+    cli = {"access_token": fake_jwt(time.time() + 3600, "root"), "refresh_token": "cli-rt-0"}
+    _write_json(lab.home / ".codex" / "auth.json", {"tokens": cli})
+    return cli
+
+
+@pytest.mark.parametrize("fault,task,layout", [
+    ("commit", "pool", "mixed"), ("commit", "singleton", "mixed"),
+    ("crash", "pool", "mixed"), ("crash", "singleton", "mixed"),
+    ("ambiguous", "pool", "mixed"), ("ambiguous", "singleton", "mixed"),
+    ("crash", "pool", "pool-only"), ("crash", "singleton", "singleton-only"),
+    ("commit", "singleton", "singleton-only"), ("ambiguous", "pool", "pool-only"),
+])
+@pytest.mark.parametrize("relogin", ["add_entry", "relogin"])
+def test_root_owner_unrecorded_redemption_is_never_replayed_anywhere(lab, fault, task, layout, relogin):
+    """The ROOT OWNER's own refresh (same profile, classic mode) POSTs, then its outcome is lost.
+    Every later pool and singleton attempt — root's own and two+ borrowing profiles' — sends
+    nothing more, the family is never revoked, the external Codex CLI login is never auto-adopted
+    while the grant is uncertain, and a supervised root sign-in (``hermes auth add`` or the
+    singleton login) clears it for every path."""
+    _write_json(lab.root / "auth.json", _root_layout(layout))
+    _borrowing_profiles(lab)
+    cli = _same_account_cli_login(lab)
+    lab.serve(valid={"root": "root-rt-0", "cli": "cli-rt-0"})
+
+    first = lab.run_one("root", task, fault=fault)
+
+    assert first.get("token") is None
+    assert [p["token"] for p in lab.endpoint()["presented"]] == ["root-rt-0"]
+    singleton, rows = _root_codex(lab)
+    held = [r["refresh_token"] for r in rows] + ([singleton["tokens"]["refresh_token"]] if singleton else [])
+    assert set(held) == {"root-rt-0"}  # never torn between row and singleton
+
+    later = lab.run(_EVERY_PATH)
+    later += lab.run(_EVERY_PATH)
+
+    endpoint = lab.endpoint()
+    assert len(endpoint["presented"]) == 1 and endpoint["revoked"] == []
+    assert [r["token"] for r in later] == [None] * len(later)
+    assert fp(cli["access_token"]) not in [r["token"] for r in later]
+    singleton, rows = _root_codex(lab)
+    assert "cli-rt-0" not in [r.get("refresh_token") for r in rows] + [
+        (singleton.get("tokens") or {}).get("refresh_token")]
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+    fresh = _grant("fresh", expired=False)
+    assert lab.run_one("root", relogin, tokens=fresh) in ({"added": True}, {"relogin": True})
+    after = lab.run(_EVERY_PATH)
+
+    assert [r["token"] for r in after] == [fp(fresh["access_token"])] * len(after)
+    assert len(lab.endpoint()["presented"]) == 1 and lab.endpoint()["revoked"] == []
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+
+@pytest.mark.parametrize("layout", ["mixed", "singleton-only", "pool-only"])
+def test_root_owner_rotation_is_one_commit_every_path_adopts_it(lab, layout):
+    """Normal root-owned rotation: root's own refresh presents the token once, row and singleton
+    land together, and root + borrowers on both paths adopt the replacement with no second POST."""
+    _write_json(lab.root / "auth.json", _root_layout(layout))
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"})
+
+    first = lab.run_one("root", "pool" if layout == "pool-only" else "singleton")
+    results = [first] + lab.run(_EVERY_PATH)
+
+    endpoint = lab.endpoint()
+    assert [p["token"] for p in endpoint["presented"]] == ["root-rt-0"] and endpoint["revoked"] == []
+    assert [r["token"] for r in results] == [fp(endpoint["issued_access"]["root"])] * len(results)
+    singleton, rows = _root_codex(lab)
+    held = [r["refresh_token"] for r in rows] + ([singleton["tokens"]["refresh_token"]] if singleton else [])
+    assert held and set(held) == {"root-rt-1"}
+    assert "refresh_outcome_pending" not in _read_json(lab.root / "auth.json") or not any(
+        _read_json(lab.root / "auth.json")["refresh_outcome_pending"].get("openai-codex", {}).values())
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+
+def test_root_owner_terminal_rejection_keeps_legitimate_cli_recovery(lab):
+    """A DEFINITIVE rejection of root's own token is not an unknown outcome: its marker is cleared
+    and the existing same-account Codex CLI recovery still repairs root (no replay, no revocation
+    of the CLI's family)."""
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root")))
+    cli = _same_account_cli_login(lab)
+    lab.serve(valid={"cli": "cli-rt-0"}, revoked=["root"])
+
+    result = lab.run_one("root", "singleton")
+
+    assert result["token"] == fp(cli["access_token"])
+    assert [p["token"] for p in lab.endpoint()["presented"]] == ["root-rt-0"]
+    singleton, _ = _root_codex(lab)
+    assert singleton["tokens"]["refresh_token"] == "cli-rt-0"
+    assert not any((_read_json(lab.root / "auth.json").get("refresh_outcome_pending") or {})
+                   .get("openai-codex", {}).values())
+
+
+@pytest.mark.parametrize("fault", [None, "crash"])
+def test_root_owner_quota_probe_refresh_is_marked_and_committed_once(lab, fault):
+    """An expired, rate-limited ROOT-owned row is refreshed before the usage probe by root itself:
+    the same marker + one-save commit. After a crash mid-probe, nothing is ever re-presented."""
+    store = _codex_store(_grant("root"), pool_row_id="rootdc")
+    store["credential_pool"]["openai-codex"][0].update(
+        last_status="exhausted", last_status_at=time.time(), last_error_code=429,
+        last_error_reason="usage_limit_reached", last_error_reset_at=time.time() + 86400)
+    del store["providers"]["openai-codex"]
+    _write_json(lab.root / "auth.json", store)
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"})
+
+    lab.run_one("root", "pool", fault=fault)
+    lab.run(_EVERY_PATH)
+
+    endpoint = lab.endpoint()
+    assert [p["token"] for p in endpoint["presented"]] == ["root-rt-0"] and endpoint["revoked"] == []
+    _, rows = _root_codex(lab)
+    assert rows[0]["refresh_token"] == ("root-rt-0" if fault else "root-rt-1")
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+
+def test_borrowing_profile_never_auto_adopts_the_external_codex_cli_login(lab):
+    """Root's grant is dead and a valid Codex CLI login exists: a borrowing profile must not import
+    it (a local shadow = a second account boundary hiding root's re-login), on any path."""
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
+    _write_json(lab.home / ".codex" / "auth.json", {"tokens": _grant("cli", expired=False)})
+    _borrowing_profiles(lab)
+    lab.serve(valid={}, revoked=["root"])
+
+    results = lab.run([("assistant", "singleton"), ("coach", "pool"), ("third", "singleton")])
+    results += lab.run([("assistant", "singleton"), ("coach", "singleton"), ("third", "pool")])
+
+    assert [r["token"] for r in results] == [None] * len(results)
+    assert [p["token"] for p in lab.endpoint()["presented"]] == ["root-rt-0"]
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+    singleton, rows = _root_codex(lab)
+    assert not str(singleton["tokens"].get("refresh_token") or "").startswith("cli-")
+    assert all(not str(r.get("refresh_token") or "").startswith("cli-") for r in rows)
+
+
+def test_profile_owned_singleton_over_root_rows_is_cleared_locally_never_marks_root(lab):
+    """Partial ownership A: the profile logged in locally (singleton, no rows) and reads root's rows."""
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
+    root_before = _root_codex(lab)
+    own = _codex_store(_grant("own"))
+    del own["credential_pool"]
+    lab.profile("assistant", auth=own)
+    lab.serve(valid={"root": "root-rt-0"}, revoked=["own"])
+
+    assert lab.run_one("assistant", "pool")["token"] is None
+
+    assert all(p["token"].startswith("own-") for p in lab.endpoint()["presented"])
+    assert _root_codex(lab) == root_before  # root's row neither marked DEAD nor given own tokens
+    local = _read_json(lab.home_of("assistant") / "auth.json")
+    assert not local["providers"]["openai-codex"]["tokens"].get("refresh_token")
+    assert local["providers"]["openai-codex"]["last_auth_error"]["relogin_required"] is True
+
+
+def test_profile_owned_rows_over_root_singleton_never_write_profile_tokens_to_root(lab):
+    """Partial ownership B: the profile owns an independent pool row and reads root's singleton."""
+    root_store = _codex_store(_grant("root"))
+    del root_store["credential_pool"]
+    _write_json(lab.root / "auth.json", root_store)
+    own_row = {"id": "owndc", "label": "own", "auth_type": "oauth", "priority": 0,
+               "source": "manual:device_code", "base_url": CODEX_BASE_URL, **_grant("own")}
+    lab.profile("assistant", auth={"version": 1, "providers": {},
+                                   "credential_pool": {"openai-codex": [own_row]}})
+    lab.serve(valid={"root": "root-rt-0"}, revoked=["own"])
+
+    lab.run_one("assistant", "pool")
+
+    endpoint = lab.endpoint()
+    assert "root" not in endpoint["revoked"]
+    singleton, rows = _root_codex(lab)
+    assert singleton["tokens"]["refresh_token"].startswith("root-rt-") and rows == []
+    assert "last_auth_error" not in singleton
+    local = _read_json(lab.home_of("assistant") / "auth.json")
+    assert "openai-codex" not in (local.get("providers") or {})  # no local singleton shadow
+    assert [r["last_status"] for r in local["credential_pool"]["openai-codex"]] == ["dead"]
+
+
+def test_root_removed_after_load_then_terminal_error_writes_no_profile_shadow(lab):
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"}, revoked=["root"])
+
+    def drop_root_codex():
+        store = _read_json(lab.root / "auth.json")
+        store["providers"].pop("openai-codex")
+        store["credential_pool"].pop("openai-codex")
+        _write_json(lab.root / "auth.json", store)
+
+    results = lab.run([("assistant", "pool"), ("third", "pool")], before_go=drop_root_codex)
+
+    assert [r["token"] for r in results] == [None, None]
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+    third = _read_json(lab.home_of("third") / "auth.json")
+    assert "active_provider" not in third
+
+
+def test_dead_singleton_only_root_grant_is_recorded_durably_and_never_re_presented(lab):
+    root_store = _codex_store(_grant("root"))
+    del root_store["credential_pool"]
+    _write_json(lab.root / "auth.json", root_store)
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"}, revoked=["root"])
+
+    lab.run([("assistant", "pool"), ("coach", "pool")])
+    second = lab.run([("assistant", "pool"), ("coach", "singleton"), ("third", "pool"), ("root", "singleton")])
+
+    assert [p["token"] for p in lab.endpoint()["presented"]] == ["root-rt-0"]
+    assert [r["token"] for r in second] == [None] * 4
+    singleton, _ = _root_codex(lab)
+    assert not singleton["tokens"].get("refresh_token")
+    assert singleton["last_auth_error"]["relogin_required"] is True
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+
+def test_singleton_path_honours_a_dead_root_row(lab):
+    """A root row already marked DEAD (the singleton still holding that token) is never presented."""
+    store = _codex_store(_grant("root"), pool_row_id="rootdc")
+    store["credential_pool"]["openai-codex"][0].update(
+        last_status="dead", last_status_at=time.time(), last_error_reason="invalid_grant")
+    _write_json(lab.root / "auth.json", store)
+    _borrowing_profiles(lab)
+    lab.serve(valid={}, revoked=["root"])
+
+    results = lab.run([("assistant", "singleton"), ("coach", "singleton"), ("root", "singleton"),
+                       ("third", "pool")])
+
+    assert lab.endpoint()["presented"] == []
+    assert [r["token"] for r in results] == [None] * 4
+
+
+@pytest.mark.parametrize("root_pool_row", [True, False], ids=["root-pool-row", "root-singleton-only"])
+def test_real_auth_add_at_root_recovers_every_path_in_every_profile(lab, root_pool_row):
+    _write_json(lab.root / "auth.json", _codex_store(
+        _grant("root"), pool_row_id="rootdc" if root_pool_row else None))
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"}, revoked=["root"])
+    lab.run([("assistant", "pool"), ("coach", "singleton")])
+    dead_presented = len(lab.endpoint()["presented"])
+
+    fresh = _grant("fresh", expired=False)
+    assert lab.run_one("root", "add_entry", tokens=fresh) == {"added": True}
+    after = lab.run([("assistant", "pool"), ("coach", "singleton"), ("third", "pool"),
+                     ("root", "singleton"), ("root", "pool")])
+
+    assert [r["token"] for r in after] == [fp(fresh["access_token"])] * 5
+    assert len(lab.endpoint()["presented"]) == dead_presented == 1
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+
+def test_unopenable_root_lock_is_an_unavailable_credential_not_a_crash(lab):
+    _write_json(lab.root / "auth.json", _codex_store(_grant("root"), pool_row_id="rootdc"))
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"})
+
+    def break_root_lock():
+        lock = lab.root / "auth.lock"
+        if lock.exists():
+            lock.unlink()
+        lock.mkdir()
+
+    results = lab.run([("assistant", "pool"), ("coach", "pool")], before_go=break_root_lock)
+
+    assert [r["token"] for r in results] == [None, None]
+    assert lab.endpoint()["presented"] == []
+    _, rows = _root_codex(lab)
+    assert rows[0].get("last_status") in (None, "ok")
