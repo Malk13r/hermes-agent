@@ -367,8 +367,9 @@ def test_unrecorded_redemption_is_never_replayed_on_any_path_in_any_profile(lab,
         assert not lab.profile_has_codex(name), name
 
 
-def _root_layout(layout: str) -> dict:
-    store = _codex_store(_grant("root"), pool_row_id=None if layout == "singleton-only" else "rootdc")
+def _root_layout(layout: str, *, expired: bool = True) -> dict:
+    store = _codex_store(_grant("root", expired=expired),
+                         pool_row_id=None if layout == "singleton-only" else "rootdc")
     if layout == "pool-only":
         del store["providers"]["openai-codex"]
     return store
@@ -492,6 +493,63 @@ def test_root_owner_quota_probe_refresh_is_marked_and_committed_once(lab, fault)
     assert [p["token"] for p in endpoint["presented"]] == ["root-rt-0"] and endpoint["revoked"] == []
     _, rows = _root_codex(lab)
     assert rows[0]["refresh_token"] == ("root-rt-0" if fault else "root-rt-1")
+    for name in ("assistant", "coach", "third"):
+        assert not lab.profile_has_codex(name), name
+
+
+def _exhausted_root(lab: Lab, layout: str, *, expired: bool) -> str:
+    """Root's own grant, rate-limited with a day-long cooldown; returns the stored access token.
+
+    A singleton-only root gets its row the real way: root's pool seeds it from the singleton and a
+    429 persists it. The token is then optionally expired on the row and the singleton together."""
+    _write_json(lab.root / "auth.json", _root_layout(layout, expired=False))
+    if layout == "singleton-only":
+        lab.run_one("root", "stale_mark")
+    store = _read_json(lab.root / "auth.json")
+    (row,) = store["credential_pool"]["openai-codex"]
+    assert row["refresh_token"] == "root-rt-0"
+    row.update(last_status="exhausted", last_status_at=time.time(), last_error_code=429,
+               last_error_reason="usage_limit_reached", last_error_reset_at=time.time() + 86400)
+    if expired:
+        row["access_token"] = fake_jwt(time.time() - 60, "root")
+        if "openai-codex" in store["providers"]:
+            store["providers"]["openai-codex"]["tokens"]["access_token"] = row["access_token"]
+    _write_json(lab.root / "auth.json", store)
+    return row["access_token"]
+
+
+@pytest.mark.parametrize("layout", ["mixed", "pool-only", "singleton-only"])
+@pytest.mark.parametrize("case", ["valid-then-expired", "expired-ambiguous", "expired-commit"])
+def test_root_owner_quota_probe_never_posts_unmarked(lab, layout, case):
+    """ROOT's own quota probe decides from one expiry check whether to lock, mark and refresh.
+    A token still valid at that check skips the lock and marker, so when the clock crosses its
+    ``exp`` before the refresh helper re-checks, the helper must not run: an unmarked POST whose
+    outcome is lost leaves root holding a spent token that a long-lived peer presents again. The
+    still-valid token goes straight to the probe. An expired token still refreshes the normal way:
+    root is marked before the POST and the marker survives a lost outcome, so nothing is replayed."""
+    crossing = case == "valid-then-expired"
+    access = _exhausted_root(lab, layout, expired=not crossing)
+    _borrowing_profiles(lab)
+    lab.serve(valid={"root": "root-rt-0"})
+
+    first = lab.run_one("root", "pool", fault="ambiguous" if crossing else case.split("-")[1],
+                        clock_cross=crossing)
+
+    presented = lab.endpoint()["presented"]
+    assert _held_refresh_tokens(*_root_codex(lab)) == {"root-rt-0"}
+    if crossing:
+        assert presented == [] and not _pending_markers(lab)
+        assert first["token"] == fp(access)
+    else:
+        assert [(p["token"], p["root_marked"]) for p in presented] == [("root-rt-0", True)]
+        assert _pending_markers(lab)
+
+    later = lab.run(_EVERY_PATH)
+
+    endpoint = lab.endpoint()
+    assert endpoint["presented"] == presented and endpoint["revoked"] == []
+    if not crossing:
+        assert [r["token"] for r in later] == [None] * len(later)
     for name in ("assistant", "coach", "third"):
         assert not lab.profile_has_codex(name), name
 

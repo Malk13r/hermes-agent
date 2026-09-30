@@ -46,8 +46,16 @@ class _Response:
 class _FakeTokenEndpoint:
     """Rotating single-use refresh tokens with family revocation on reuse."""
 
-    def __init__(self, server: Path, label: str):
-        self.server, self.label = server, label
+    def __init__(self, server: Path, label: str, root_auth: Path):
+        self.server, self.label, self.root_auth = server, label, root_auth
+
+    def _root_marked(self) -> bool:
+        """Whether root's ``auth.json`` held a pending-refresh marker when the POST arrived."""
+        try:
+            store = json.loads(self.root_auth.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return any(((store.get("refresh_outcome_pending") or {}).get("openai-codex") or {}).values())
 
     def __enter__(self):
         return self
@@ -61,12 +69,13 @@ class _FakeTokenEndpoint:
 
     def post(self, url, headers=None, data=None):
         presented = (data or {}).get("refresh_token") or ""
+        marked = self._root_marked()
         time.sleep(0.3)  # network latency keeps the read -> POST -> write window open
         with open(self.server, "r+") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             state = json.load(handle)
             family = presented.split("-rt-")[0]
-            state["presented"].append({"by": self.label, "token": presented})
+            state["presented"].append({"by": self.label, "token": presented, "root_marked": marked})
             current = state["valid"].get(family)
             if family in state["revoked"] or presented != current:
                 if family not in state["revoked"]:
@@ -124,9 +133,16 @@ def _inject_fault(spec: dict) -> None:
       case a client cannot tell apart from a refusal that rotated nothing);
     * ``unsent`` — the connection cannot be opened: the request never leaves the host.
 
-    Profile saves are untouched."""
+    ``clock_cross`` (independent of ``fault``): the clock crosses the access token's ``exp`` between
+    the pool's quota-probe expiry check and the refresh helper's own re-check (the helper's module
+    sees the clock two hours later). Profile saves are untouched."""
     import hermes_cli.auth as auth_mod
 
+    if spec.get("clock_cross"):
+        import hermes_cli.auth_codex as auth_codex
+
+        real_expiring = auth_codex._codex_access_token_is_expiring
+        auth_codex._codex_access_token_is_expiring = lambda token, skew: real_expiring(token, skew + 7200)
     fault = spec.get("fault")
     if fault == "unsent":
         import httpx
@@ -268,7 +284,8 @@ def main() -> None:
     import hermes_cli.auth_codex as auth_codex
 
     label = spec.get("label", "")
-    auth_codex._codex_http_client = lambda **_kw: _FakeTokenEndpoint(Path(spec["server"]), label)
+    auth_codex._codex_http_client = lambda **_kw: _FakeTokenEndpoint(
+        Path(spec["server"]), label, Path(spec["expected_root"]) / "auth.json")
     result = _TASKS[spec["task"]](spec)
     sys.stdout.write(json.dumps({"worker": result}, sort_keys=True) + "\n")
     sys.stdout.flush()

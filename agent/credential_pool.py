@@ -2030,9 +2030,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin,
                     if owner is None and codex_own_row_moved_on(entry.id, entry.refresh_token):
                         return False
                 spent = entry.refresh_token
+                # The helper re-reads the clock: a token that was still valid above (no lock, no
+                # marker) may have expired since, so only the locked, marked path may call it.
                 fresh = auth_mod._refresh_expired_codex_probe_token(
                     token, spent, before_post=None if owner is None else (
-                        lambda: mark_codex_refresh_pending(owner, spent)))
+                        lambda: mark_codex_refresh_pending(owner, spent))) if needs_refresh else None
                 if fresh:
                     rotated = replace(
                         entry, access_token=fresh["access_token"], refresh_token=fresh["refresh_token"],
